@@ -8,7 +8,7 @@ LABELS_DIR = Path("C:\\Users\\User\\Desktop\\Projects\\Work\\scripts\\test\\labe
 YAML_PATH = Path("C:\\Users\\User\\Desktop\\Projects\\Work\\scripts\\data.yaml")
 
 IMAGE_EXTS = [".jpg", ".jpeg", ".png", ".bmp"]
-
+WINDOW_NAME = "YOLO Viewer"
 
 # ---------- Загрузка имён классов ----------
 with open(YAML_PATH, "r", encoding="utf-8") as f:
@@ -18,10 +18,8 @@ NAMES = data.get("names", [])
 print(f"[INFO] Загружено классов: {len(NAMES)}")
 
 
-
-
 def get_class_color(class_id):
-    random.seed(class_id)  # один и тот же цвет для одного id
+    random.seed(class_id)
     return (
         random.randint(50, 255),
         random.randint(50, 255),
@@ -53,17 +51,14 @@ def draw_yolo_boxes(image, label_path):
             y2 = int(y_center + bh / 2)
 
             color = get_class_color(class_id)
-
             cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
 
-            # Имя класса
             if 0 <= class_id < len(NAMES):
                 class_name = NAMES[class_id]
             else:
                 class_name = f"id {class_id}"
 
             label = f"{class_name}"
-
             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
             y1_text = max(y1 - th - 6, 0)
 
@@ -74,8 +69,9 @@ def draw_yolo_boxes(image, label_path):
     return image
 
 
+# ---------- Подготовка ----------
+cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
 
-# ---------- Список изображений ----------
 image_paths = sorted([p for p in IMAGES_DIR.iterdir() if p.suffix.lower() in IMAGE_EXTS])
 
 if not image_paths:
@@ -84,9 +80,12 @@ if not image_paths:
 
 index = 0
 
+# ---------- Основной цикл ----------
 while True:
     img_path = image_paths[index]
     label_path = LABELS_DIR / (img_path.stem + ".txt")
+
+    print(f"\n[IMAGE] {img_path.name}")  # <-- теперь имя всегда в консоли
 
     image = cv2.imread(str(img_path))
     if image is None:
@@ -103,21 +102,20 @@ while True:
     cv2.putText(image, info, (20, image.shape[0] - 20),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-    cv2.imshow("YOLO Viewer", image)
+    cv2.imshow(WINDOW_NAME, image)
+    cv2.setWindowTitle(WINDOW_NAME, img_path.name)
+
     key = cv2.waitKeyEx(0)
 
     if key == 27:  # ESC
-     break
+        break
 
-    # Стрелка вправо / D / d
+    # Следующее изображение
     elif key in [ord('d'), ord('D'), 2555904]:
         index = (index + 1) % len(image_paths)
 
-    # Стрелка влево / A / a
+    # Предыдущее изображение
     elif key in [ord('a'), ord('A'), 2424832]:
         index = (index - 1) % len(image_paths)
-
-    print("KEY:", key)  # можно оставить для отладки
-
 
 cv2.destroyAllWindows()
