@@ -7,248 +7,216 @@ import cv2
 import os
 import json
 
-print("🖥️ Ejecutando en CPU (GPU deshabilitada)")
-
 # ================================
-# MODELOS
+# Настройки
 # ================================
-
-ids_model = YOLO(
-    "C:\\Users\\User\\Desktop\\Projects\\Work\\ISO_6346_rec\\yolo11_container\\YOLO_IDs\\ID_YOLO_container\\weights\\best.pt"
-)
-
-# ⚠️ ТВОЯ YOLO-МОДЕЛЬ СИМВОЛОВ ['0'..'9','A'..'Z']
-char_model = YOLO(
-    "PATH_TO_YOUR_CHAR_MODEL\\weights\\best.pt"
-)
-
-ocr_model = easyocr.Reader(['en', 'es'], gpu=False)
-
-video_path = "C:\\Users\\User\\Desktop\\Projects\\Work\\ISO_6346_rec\\yolo11_container\\videos\\label_09158888.mp4"
-
-CONFIDENCE_THRESHOLD_YOLO_IDS = 0.5
-CONFIDENCE_THRESHOLD_YOLO_CHARS = 0.4
 SCALE_FACTOR = 0.75
 SKIP_FRAMES = 3
+CONFIDENCE_THRESHOLD_YOLO_IDS = 0.5
+CONFIDENCE_THRESHOLD_YOLO_CHARS = 0.4
 
-# ============================================================
-# NORMALIZACIÓN
-# ============================================================
+# Пути к моделям YOLO
+IDS_MODEL_PATH = r"C:\Users\User\Desktop\Projects\Work\ISO_6346_rec\yolo11_container\YOLO_IDs\ID_YOLO_container\weights\best.pt"
+CHAR_MODEL_PATH = r"C:\Users\User\Desktop\Projects\Work\ISO_6346_rec\yolo11_container\YOLO_Characters\Character_YOLO_container_finetune_extra_large_phase2\weights\best.pt"
 
-def normalize_code(value: str, key: str) -> str:
-    if not value:
-        return value
+# EasyOCR: укажи папку, где локально лежат модели
+OCR_MODEL_PATH = r"C:\Users\User\.EasyOCR"
 
-    if key in ["cn-11", "cn-4", "code-container"]:
-        prefix = (
-            value[:4]
-            .replace("0", "O")
-            .replace("1", "I")
-            .replace("5", "S")
-            .replace("2", "Z")
-            .replace("8", "B")
-            .replace("6", "G")
-            .replace("4", "A")
-            .replace("7", "T")
-        )
-        return prefix + value[4:]
+# ================================
+# Инициализация моделей
+# ================================
+print("🖥️ Ejecutando en CPU (GPU deshabilitada)")
 
-    return value
+ids_model = YOLO(IDS_MODEL_PATH)
+char_model = YOLO(CHAR_MODEL_PATH)
 
+ocr_model = easyocr.Reader(
+    ['en','es'],
+    gpu=False,
+    model_storage_directory=OCR_MODEL_PATH,
+    download_enabled=False  # отключаем автоматическое скачивание
+)
 
-# ============================================================
-# REGEX
-# ============================================================
-
+# ================================
+# Regex и нормализация
+# ================================
 rules = {
     "code-container": {"attribute": "code-container", "regex": r"^[A-Z]{4}\d{7}$"},
     "cn-11": {"attribute": "cn-11", "regex": r"^[A-Z]{4}\d{7}$"},
     "cn-4": {"attribute": "cn-4", "regex": r"^[A-Z]{4}$"},
     "cn-7": {"attribute": "cn-7", "regex": r"^\d{7}$"},
-    "iso-type": {"attribute": "iso-type", "regex": r"^\d{2}[A-Z][A-Z0-9]$"},
+    "iso-type": {"attribute": "iso-type", "regex": r"^\d{2}[A-Z][A-Z0-9]$"}
 }
 
+def normalize_code(value: str, key: str) -> str:
+    if not value:
+        return value
+    if key in ["cn-11", "cn-4", "code-container"]:
+        prefix = value[:4].replace("0", "O").replace("1", "I").replace("5", "S") \
+                          .replace("2", "Z").replace("8", "B").replace("6", "G") \
+                          .replace("4", "A").replace("7", "T")
+        rest = value[4:]
+        return prefix + rest
+    return value
 
 def parse_detecciones(detecciones, rules):
     parsed = {}
     for key, value in detecciones.items():
-        if key not in rules:
-            continue
-
-        raw = value["text"] if isinstance(value, dict) else value
-        norm = normalize_code(raw, key)
-        valid = bool(re.match(rules[key]["regex"], norm))
-
-        parsed[rules[key]["attribute"]] = {
-            "raw": raw,
-            "normalized": norm,
-            "valid": "✔️" if valid else "❌",
-        }
-
+        if key in rules:
+            if isinstance(value, dict) and "text" in value:
+                value_to_validate = value["text"]
+            else:
+                value_to_validate = value
+            attr = rules[key]["attribute"]
+            pattern = rules[key]["regex"]
+            value_norm = normalize_code(value_to_validate, key)
+            match = bool(re.match(pattern, value_norm))
+            parsed[attr] = {"raw": value_to_validate, "normalized": value_norm, "valid": "✔️" if match else "❌"}
     return parsed
-
-
-# ============================================================
-# ISO 6346 CHECK DIGIT
-# ============================================================
 
 def calculate_check_digit(container_code: str):
     if not container_code or len(container_code) != 11:
         return None
     if not container_code[:4].isalpha():
         return None
-
-    letter_values = {
-        'A': 10, 'B': 12, 'C': 13, 'D': 14, 'E': 15, 'F': 16, 'G': 17,
-        'H': 18, 'I': 19, 'J': 20, 'K': 21, 'L': 23, 'M': 24, 'N': 25,
-        'O': 26, 'P': 27, 'Q': 28, 'R': 29, 'S': 30, 'T': 31, 'U': 32,
-        'V': 34, 'W': 35, 'X': 36, 'Y': 37, 'Z': 38
-    }
-
+    code_10 = container_code[:10]
+    letter_values = { 'A':10,'B':12,'C':13,'D':14,'E':15,'F':16,'G':17,'H':18,'I':19,'J':20,
+                     'K':21,'L':23,'M':24,'N':25,'O':26,'P':27,'Q':28,'R':29,'S':30,'T':31,
+                     'U':32,'V':34,'W':35,'X':36,'Y':37,'Z':38 }
     values = []
-    for c in container_code[:10]:
-        values.append(letter_values[c] if c.isalpha() else int(c))
-
-    total = sum(v * (2 ** i) for i, v in enumerate(values))
+    for char in code_10:
+        values.append(letter_values[char.upper()] if char.isalpha() else int(char))
+    total = sum(val * (2 ** i) for i, val in enumerate(values))
     check_digit = total % 11
-    if check_digit == 10:
-        check_digit = 0
+    if check_digit == 10: check_digit = 0
+    last_digit = container_code[10]
+    if last_digit.isdigit() and int(last_digit) == check_digit:
+        return container_code
+    return None
 
-    return container_code if int(container_code[-1]) == check_digit else None
+# ================================
+# Глобальный трек кодов
+# ================================
+codigos_detectados = {}
+next_id = 1
 
+# ================================
+# Функция обработки одного кадра
+# ================================
+def predict_frame(frame_bgr):
+    global codigos_detectados, next_id
 
-# ============================================================
-# PREDICT IMAGE
-# ============================================================
+    image_pil = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+    # Тут используем ту же функцию predict (YOLO char + OCR)
+    # Для краткости используем упрощённый вариант:
+    # Возвращает annotated_frame (BGR) и salida_json
+    annotated_frame, salida_json = predict(image_pil)  # твоя функция predict
 
-def predict(image: Image.Image):
-    detecciones_yolo = {}
-    detecciones_easy = {}
+    # Получаем финальный код
+    codigo_final_id = salida_json.get("codigo_final_id")
+    track_id = salida_json.get("codigo_final_track")
+    codigo_conf = salida_json.get("codigo_final_conf", 0.0)
 
-    img_gray = image.convert("L")
-    img_np = np.array(img_gray)
-    img_ready = cv2.cvtColor(img_np, cv2.COLOR_GRAY2RGB)
-
-    results_id = ids_model.track(
-        img_ready,
-        conf=CONFIDENCE_THRESHOLD_YOLO_IDS,
-        persist=True,
-        verbose=False
-    )
-
-    detections = []
-    for box in results_id[0].boxes:
-        cls = ids_model.names[int(box.cls[0])]
-        conf = float(box.conf[0])
-        x1, y1, x2, y2 = box.xyxy[0].tolist()
-        track_id = int(box.id[0]) if box.id is not None else None
-
-        detections.append((cls, conf, (x1, y1, x2, y2), track_id))
-
-    best = {}
-    for cls, conf, coords, tid in detections:
-        if cls not in best or conf > best[cls][1]:
-            best[cls] = (cls, conf, coords, tid)
-
-    img_boxes = Image.fromarray(results_id[0].plot())
-
-    cn4_y, cn7_y, cn11_y = None, None, None
-    cn4_e, cn7_e, cn11_e = None, None, None
-    track_final = None
-
-    for cls, _, (x1, y1, x2, y2), track_id in best.values():
-        crop = image.crop((x1, y1, x2, y2))
-
-        results_char = char_model.predict(
-            crop,
-            conf=CONFIDENCE_THRESHOLD_YOLO_CHARS,
-            verbose=False
-        )
-
-        chars = []
-        for cbox in results_char[0].boxes:
-            char = char_model.names[int(cbox.cls[0])]
-            conf = float(cbox.conf[0])
-            cx1, cy1, cx2, cy2 = cbox.xyxy[0].tolist()
-            chars.append({
-                "x": cx1,
-                "y": cy1,
-                "symbol": char,
-                "conf": conf,
-                "crop": crop.crop((cx1, cy1, cx2, cy2))
-            })
-
-        if cls in ["cn-11", "iso-type"]:
-            chars.sort(key=lambda c: c["y"] if crop.height > crop.width else c["x"])
+    if codigo_final_id:
+        existing_by_track = {k:v for k,v in codigos_detectados.items() if v['track_id']==track_id}
+        if track_id is not None and existing_by_track:
+            existing = list(existing_by_track.values())[0]
+            if codigo_conf > existing["conf"]:
+                existing["code"] = codigo_final_id
+                existing["conf"] = codigo_conf
+                print(f"🔄 Track {track_id} updated with conf {codigo_conf:.2f} (Code={codigo_final_id})")
         else:
-            chars.sort(key=lambda c: c["x"])
+            if not any(v['code']==codigo_final_id for v in codigos_detectados.values()):
+                codigos_detectados[next_id] = {
+                    "code": codigo_final_id,
+                    "track_id": track_id,
+                    "conf": codigo_conf
+                }
+                print(f"✔️ New code detected: {codigo_final_id} | Track={track_id} | Conf={codigo_conf:.2f}")
+                next_id += 1
 
-        text_yolo = "".join(c["symbol"] for c in chars)
-        conf_yolo = np.mean([c["conf"] for c in chars]) if chars else 0.0
+    # Overlay на изображение
+    y_offset = 70
+    for info in codigos_detectados.values():
+        track_display = info['track_id'] if info['track_id'] is not None else "None"
+        display_text = f"{info['code']} | Track={track_display} | Conf={info['conf']:.2f}"
+        cv2.putText(
+            annotated_frame, display_text, (30, y_offset),
+            cv2.FONT_HERSHEY_SIMPLEX, 1.25, (0,255,0), 3, cv2.LINE_AA
+        )
+        y_offset += 50
 
-        detecciones_yolo[cls] = {
-            "text": text_yolo,
-            "confidence": conf_yolo,
-            "track_id": track_id
-        }
+    return annotated_frame, salida_json
 
-        # ---------- EasyOCR ----------
-        ocr_img = crop
-        if chars:
-            total_w = sum(c["crop"].width for c in chars)
-            max_h = max(c["crop"].height for c in chars)
-            recon = Image.new("RGB", (total_w, max_h))
-            xoff = 0
-            for c in chars:
-                recon.paste(c["crop"], (xoff, 0))
-                xoff += c["crop"].width
-            ocr_img = recon
+# ================================
+# Обработка видео
+# ================================
+def process_video(video_path):
+    cap = cv2.VideoCapture(video_path)
+    video_dir = os.path.dirname(video_path)
+    video_name = os.path.basename(video_path)
+    output_name = f"label_{video_name}"
+    output_path = os.path.join(video_dir, output_name)
 
-        ocr = ocr_model.readtext(np.array(ocr_img), detail=1)
-        if ocr:
-            txt = "".join(r[1] for r in ocr).upper()
-            txt = re.sub(r'[^A-Z0-9]', '', txt)
-            conf = np.mean([r[2] for r in ocr])
-            detecciones_easy[cls] = {"text": txt, "confidence": conf}
+    frame_id = 0
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(
+        output_path,
+        fourcc,
+        cap.get(cv2.CAP_PROP_FPS),
+        (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+    )
+    print(f"📀 Saving annotated video to: {output_path}")
 
-        if cls == "cn-11":
-            cn11_y, cn11_e = text_yolo, detecciones_easy.get(cls, {}).get("text")
-            track_final = track_id
-        if cls == "cn-4":
-            cn4_y, cn4_e = text_yolo, detecciones_easy.get(cls, {}).get("text")
-        if cls == "cn-7":
-            cn7_y, cn7_e = text_yolo, detecciones_easy.get(cls, {}).get("text")
+    ultimo_frame_annotated = None
+    ultimo_salida_json = None
 
-    if cn11_y:
-        detecciones_yolo["code-container"] = {
-            "text": cn11_y,
-            "confidence": detecciones_yolo["cn-11"]["confidence"],
-            "track_id": track_final
-        }
-    elif cn4_y and cn7_y:
-        detecciones_yolo["code-container"] = {
-            "text": cn4_y + cn7_y,
-            "confidence": np.mean([
-                detecciones_yolo["cn-4"]["confidence"],
-                detecciones_yolo["cn-7"]["confidence"]
-            ]),
-            "track_id": track_final
-        }
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret: break
 
-    if cn11_e:
-        detecciones_easy["code-container"] = {"text": cn11_e}
-    elif cn4_e and cn7_e:
-        detecciones_easy["code-container"] = {"text": cn4_e + cn7_e}
+        if frame_id % SKIP_FRAMES == 0:
+            small_frame = cv2.resize(frame, (0,0), fx=SCALE_FACTOR, fy=SCALE_FACTOR)
+            annotated_small, salida_json = predict_frame(small_frame)
+            annotated_frame = cv2.resize(annotated_small, (frame.shape[1], frame.shape[0]))
+            ultimo_frame_annotated = annotated_frame.copy()
+            ultimo_salida_json = salida_json
+        else:
+            annotated_frame = ultimo_frame_annotated.copy()
+            salida_json = ultimo_salida_json
 
-    parsed_y = parse_detecciones(detecciones_yolo, rules)
-    parsed_e = parse_detecciones(detecciones_easy, rules)
+        out.write(annotated_frame)
+        frame_id += 1
 
-    valid_y = calculate_check_digit(parsed_y["code-container"]["normalized"]) if "code-container" in parsed_y else None
-    valid_e = calculate_check_digit(parsed_e["code-container"]["normalized"]) if "code-container" in parsed_e else None
+    cap.release()
+    out.release()
+    print("✅ Video processing finished")
+    return output_path
 
-    final_code = valid_y or valid_e
+# ================================
+# Обработка одного изображения
+# ================================
+def process_image(image_path):
+    frame_bgr = cv2.imread(image_path)
+    if frame_bgr is None:
+        raise FileNotFoundError(f"Image not found: {image_path}")
+    annotated_frame, salida_json = predict_frame(frame_bgr)
+    out_path = image_path.replace(".jpg","_label.jpg").replace(".png","_label.png")
+    cv2.imwrite(out_path, annotated_frame)
+    # Сохраняем JSON
+    with open(out_path.replace(".jpg",".json").replace(".png",".json"), "w", encoding="utf-8") as f:
+        json.dump(salida_json, f, indent=4, ensure_ascii=False)
+    print(f"✅ Saved annotated image: {out_path}")
+    return annotated_frame, salida_json
 
-    return img_boxes, {
-        "codigo_final_id": final_code,
-        "codigo_final_track": track_final
-    }
+# ================================
+# Пример использования
+# ================================
+if __name__ == "__main__":
+    # 1️⃣ Видео
+    video_path = r"C:\Users\User\Desktop\Projects\Work\ISO_6346_rec\videos\label_09158888.mp4"
+    process_video(video_path)
+
+    # 2️⃣ Изображение
+    img_path = r"C:\Users\User\Desktop\Projects\Work\ISO_6346_rec\images\container1.jpg"
+    process_image(img_path)
