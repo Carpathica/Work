@@ -1,0 +1,75 @@
+import os
+from ultralytics import YOLO
+
+# =======================
+# НАСТРОЙКИ
+# =======================
+
+# Пути к моделям
+MODEL_PATHS = [
+    "models/yolov8s.pt",
+    "models/yolov8m.pt",
+    "models/yolov11s.pt"
+]
+
+# Путь к тестовой выборке
+DATASET_PATH = "test"
+
+# Конфиг временного датасета
+DATA_YAML = "test_dataset.yaml"
+
+# =======================
+# Создание временного yaml
+# =======================
+
+def create_data_yaml():
+    content = f"""
+path: {os.path.abspath(DATASET_PATH)}
+train: images
+val: images
+
+names:
+  0: object
+"""
+    with open(DATA_YAML, "w") as f:
+        f.write(content)
+
+# =======================
+# Основной код
+# =======================
+
+def evaluate_models():
+    create_data_yaml()
+
+    for model_path in MODEL_PATHS:
+        model_name = os.path.splitext(os.path.basename(model_path))[0]
+        print(f"\n===== Evaluating {model_name} =====")
+
+        model = YOLO(model_path)
+
+        # 1️⃣ Сохранение изображений с bbox
+        model.predict(
+            source=os.path.join(DATASET_PATH, "images"),
+            save=True,
+            project="results",
+            name=model_name,
+            exist_ok=True
+        )
+
+        # 2️⃣ Подсчет метрик
+        metrics = model.val(
+            data=DATA_YAML,
+            split="val",
+            project="results",
+            name=f"{model_name}_metrics",
+            exist_ok=True
+        )
+
+        print("\nMetrics:")
+        print(f"Precision: {metrics.box.p.mean():.4f}")
+        print(f"Recall:    {metrics.box.r.mean():.4f}")
+        print(f"mAP50:     {metrics.box.map50:.4f}")
+        print(f"mAP50-95:  {metrics.box.map:.4f}")
+
+if __name__ == "__main__":
+    evaluate_models()
