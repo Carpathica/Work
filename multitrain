@@ -1,0 +1,111 @@
+import os
+import shutil
+from ultralytics import YOLO
+from ray import tune
+
+# 📂 Папка для сохранения финальных моделей
+RESULTS_DIR = "train_results"
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
+# 🔹 Список конфигураций моделей
+training_configs = [
+    {
+        "name": "exp_nano",
+        "model_path": "yolov8n.pt",
+        "tune": True,
+        "tune_epochs": 30,
+        "tune_samples": 20,
+        "train_epochs": 150,
+        "batch": 16,
+        "imgsz": 640,
+        "lr": 0.01
+    },
+    {
+        "name": "exp_small",
+        "model_path": "yolov8s.pt",
+        "tune": False,      # просто обычное обучение
+        "train_epochs": 120,
+        "batch": 12,
+        "imgsz": 640,
+        "lr": 0.005
+    }
+]
+
+# 🔹 Путь к вашему датасету
+dataset_yaml = "data/my_dataset.yaml"
+
+# 🔹 Процесс обучения
+for cfg in training_configs:
+    exp_name = f"train_{cfg['name']}"
+    print(f"\n=== Работаем с моделью {cfg['model_path']} (эксперимент: {exp_name}) ===")
+
+    # Загружаем pretrained модель
+    model = YOLO(cfg["model_path"])
+
+    best_params = {}  # сюда запишем лучшие гиперпараметры после тюнинга
+
+    # 🔹 Если включен тюнинг
+    if cfg.get("tune", False):
+        print(f"--- Запуск тюнинга гиперпараметров для {cfg['name']} ---")
+
+        # Настройка search space (можно расширить)
+        tune_space = {
+            "lr0": tune.uniform(1e-5, 1e-1),
+            "weight_decay": tune.uniform(0.0, 1e-3),
+            "momentum": tune.uniform(0.6, 0.98)
+        }
+
+        # Запуск тюнинга
+        tune_result = model.tune(
+            data=dataset_yaml,
+            use_ray=True,
+            space=tune_space,
+            gpu_per_trial=1,
+            max_samples=cfg["tune_samples"],
+            train_args={"epochs": cfg["tune_epochs"]},
+            val=True,
+            save=True
+        )
+
+        # Получаем лучшие гиперпараметры
+        best_params = tune_result.best_config
+        print(f"Лучшие гиперпараметры для {cfg['name']}: {best_params}")
+
+    # 🔹 Финальное обучение
+    print(f"--- Финальное обучение {cfg['name']} ---")
+
+    # Берём параметры из тюнинга или дефолтные
+    train_args = {
+        "data": dataset_yaml,
+        "epochs": cfg["train_epochs"],
+        "batch": cfg["batch"],
+        "imgsz": cfg["imgsz"],
+        "lr": cfg.get("lr", 0.01),
+        "project": "runs/train",
+        "name": exp_name
+    }
+
+    # Если есть best_params после тюнинга — используем их
+    if best_params:
+        train_args.update(best_params)
+
+    # Запуск обучения
+    model.train(**train_args)
+
+    # 🔹 Сохраняем веса
+    run_dir = os.path.join("runs", "train", exp_name)
+    weights_dir = os.path.join(run_dir, "weights")
+    best_weight = os.path.join(weights_dir, "best.pt")
+    last_weight = os.path.join(weights_dir, "last.pt")
+
+    out_best = os.path.join(RESULTS_DIR, f"{exp_name}.pt")
+    out_last = os.path.join(RESULTS_DIR, f"{exp_name}_last.pt")
+
+    if os.path.exists(best_weight):
+        shutil.copyfile(best_weight, out_best)
+        print(f"✅ Сохранён лучший вес: {out_best}")
+    if os.path.exists(last_weight):
+        shutil.copyfile(last_weight, out_last)
+        print(f"🔁 Сохранён последний вес: {out_last}")
+
+    print(f"=== Завершено обучение {cfg['name']} ===\n")
