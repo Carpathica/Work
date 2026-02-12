@@ -145,6 +145,107 @@ def predict_frame(original_frame_bgr):
 
     return annotated_frame, salida_json
 
+def predict(image_pil):
+
+    frame_bgr = cv2.cvtColor(np.array(image_pil), cv2.COLOR_RGB2BGR)
+    salida_json = {
+        "codigo_final_id": None,
+        "codigo_final_track": None,
+        "codigo_final_conf": 0.0
+    }
+
+    # ================================
+    # 1️⃣ Детекция контейнера (ID YOLO)
+    # ================================
+    results_ids = ids_model(frame_bgr, verbose=False)[0]
+
+    if results_ids.boxes is None or len(results_ids.boxes) == 0:
+        return frame_bgr, salida_json
+
+    best_box = None
+    best_conf = 0
+
+    for box in results_ids.boxes:
+        conf = float(box.conf[0])
+        if conf > best_conf:
+            best_conf = conf
+            best_box = box
+
+    if best_box is None:
+        return frame_bgr, salida_json
+
+    x1, y1, x2, y2 = map(int, best_box.xyxy[0])
+    track_id = None
+
+    if hasattr(best_box, "id") and best_box.id is not None:
+        track_id = int(best_box.id[0])
+
+    roi = frame_bgr[y1:y2, x1:x2]
+
+    # Рисуем bbox контейнера
+    cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+    # ================================
+    # 2️⃣ Детекция символов
+    # ================================
+    results_chars = char_model(roi, verbose=False)[0]
+
+    if results_chars.boxes is None or len(results_chars.boxes) == 0:
+        return frame_bgr, salida_json
+
+    characters = []
+
+    for box in results_chars.boxes:
+        conf = float(box.conf[0])
+        cls_id = int(box.cls[0])
+        label = char_model.names[cls_id]
+
+        cx1, cy1, cx2, cy2 = map(int, box.xyxy[0])
+        characters.append((cx1, label, conf))
+
+        # рисуем bbox символа
+        cv2.rectangle(
+            frame_bgr,
+            (x1 + cx1, y1 + cy1),
+            (x1 + cx2, y1 + cy2),
+            (255, 0, 0),
+            1
+        )
+
+    # ================================
+    # 3️⃣ Сортировка слева направо
+    # ================================
+    characters = sorted(characters, key=lambda x: x[0])
+
+    text = ""
+    total_conf = 0
+
+    for _, label, conf in characters:
+        text += label
+        total_conf += conf
+
+    avg_conf = total_conf / len(characters)
+
+    # ================================
+    # 4️⃣ Финальный результат
+    # ================================
+    salida_json["codigo_final_id"] = text
+    salida_json["codigo_final_track"] = track_id
+    salida_json["codigo_final_conf"] = avg_conf
+
+    # Отображаем текст
+    cv2.putText(
+        frame_bgr,
+        text,
+        (x1, y1 - 10),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1,
+        (0, 255, 0),
+        2,
+        cv2.LINE_AA
+    )
+
+    return frame_bgr, salida_json
 
 # ================================
 # Видео
