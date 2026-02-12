@@ -1,0 +1,90 @@
+from ultralytics import YOLO
+import easyocr
+import cv2
+import re
+import numpy as np
+
+# ==============================
+# Пути
+# ==============================
+YOLO_MODEL_PATH = r"best.pt"   # модель для детекции контейнера
+IMAGE_PATH = r"container.jpg"
+
+# ==============================
+# Инициализация
+# ==============================
+model = YOLO(YOLO_MODEL_PATH)
+reader = easyocr.Reader(['en'], gpu=False)
+
+# ==============================
+# ISO 6346 regex
+# ==============================
+ISO_REGEX = r'[A-Z]{4}\d{7}'
+
+# ==============================
+# Предсказание
+# ==============================
+def detect_container_and_read(image_path):
+
+    image = cv2.imread(image_path)
+    if image is None:
+        raise FileNotFoundError(image_path)
+
+    results = model(image)[0]
+
+    if len(results.boxes) == 0:
+        print("Контейнер не найден")
+        return
+
+    # Берём bbox с наибольшим confidence
+    best_box = max(results.boxes, key=lambda b: float(b.conf[0]))
+
+    x1, y1, x2, y2 = map(int, best_box.xyxy[0])
+    roi = image[y1:y2, x1:x2]
+
+    # OCR внутри ROI
+    ocr_results = reader.readtext(roi)
+
+    detected_text = ""
+    for (_, text, conf) in ocr_results:
+        detected_text += text.upper()
+
+    # Удаляем лишние символы
+    detected_text = re.sub(r'[^A-Z0-9]', '', detected_text)
+
+    # Поиск ISO номера
+    match = re.search(ISO_REGEX, detected_text)
+
+    if match:
+        container_number = match.group()
+        print("Найден номер:", container_number)
+    else:
+        print("ISO номер не найден")
+        container_number = None
+
+    # Рисуем bbox и текст
+    cv2.rectangle(image, (x1, y1), (x2, y2), (0,255,0), 2)
+
+    if container_number:
+        cv2.putText(
+            image,
+            container_number,
+            (x1, y1 - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1,
+            (0,255,0),
+            2
+        )
+
+    cv2.imshow("Result", image)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
+    return container_number
+
+
+# ==============================
+# Запуск
+# ==============================
+if __name__ == "__main__":
+    detect_container_and_read(IMAGE_PATH)
