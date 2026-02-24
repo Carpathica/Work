@@ -1,0 +1,2 @@
+"""YOLO web annotator package."""
+

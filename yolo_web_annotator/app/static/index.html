@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>YOLO Web Annotator</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="bg-shape bg-shape-a"></div>
+  <div class="bg-shape bg-shape-b"></div>
+  <div class="layout">
+    <aside class="panel panel-left">
+      <h1>YOLO Annotator</h1>
+      <p class="subtitle">Browser labeling with manual edits and YOLO auto-label.</p>
+
+      <label class="input-group">
+        <span>Dataset directory</span>
+        <div class="path-row">
+          <input id="datasetDirInput" type="text" placeholder="C:\datasets\my_project">
+          <button id="browseDatasetBtn" class="btn">Browse</button>
+        </div>
+      </label>
+
+      <label class="input-group">
+        <span>YOLO model path (optional)</span>
+        <div class="path-row">
+          <input id="modelPathInput" type="text" placeholder="C:\models\best.pt">
+          <button id="browseModelBtn" class="btn">Browse</button>
+        </div>
+      </label>
+
+      <label class="input-group">
+        <span>Labels output directory (optional)</span>
+        <div class="path-row">
+          <input id="labelsDirInput" type="text" placeholder="C:\datasets\my_labels">
+          <button id="browseLabelsBtn" class="btn">Browse</button>
+        </div>
+      </label>
+
+      <label class="input-group">
+        <span>Classes file YAML/TXT (optional)</span>
+        <div class="path-row">
+          <input id="classesFileInput" type="text" placeholder="C:\datasets\data.yaml">
+          <button id="browseClassesBtn" class="btn">Browse</button>
+        </div>
+      </label>
+
+      <label class="input-group">
+        <span>Classes (one per line)</span>
+        <textarea id="classesInput" rows="7" placeholder="person&#10;car&#10;traffic_light"></textarea>
+      </label>
+
+      <button id="loadSessionBtn" class="btn btn-primary">Load Dataset</button>
+
+      <div class="hint">
+        <div>Mouse controls:</div>
+        <div>Draw: drag on empty space</div>
+        <div>Move: drag inside selected box</div>
+        <div>Resize: drag corner handles</div>
+        <div>Delete: <code>Del</code> key or button</div>
+      </div>
+    </aside>
+
+    <main class="panel panel-main">
+      <div class="toolbar">
+        <button id="prevBtn" class="btn">Prev</button>
+        <button id="nextBtn" class="btn">Next</button>
+        <select id="imageSelect" class="select-grow"></select>
+        <span id="imageCounter" class="counter">0 / 0</span>
+      </div>
+
+      <div class="toolbar toolbar-secondary">
+        <button id="predictBtn" class="btn">Auto-label</button>
+        <button id="saveBtn" class="btn btn-primary">Save</button>
+        <button id="saveAllBtn" class="btn btn-primary">Save All</button>
+        <label class="input-group small inline-compact">
+          <span>Conf</span>
+          <input id="confInput" type="number" min="0" max="1" step="0.01" value="0.25">
+        </label>
+        <label class="input-group checkbox-group">
+          <span>Remove overlaps</span>
+          <input id="overlapCleanupCheck" type="checkbox">
+        </label>
+        <label class="input-group small inline-compact">
+          <span>Overlap %</span>
+          <input id="overlapThresholdInput" type="number" min="1" max="100" step="1" value="50">
+        </label>
+        <button id="applyOverlapBtn" class="btn">Apply</button>
+        <button id="zoomOutBtn" class="btn">-</button>
+        <button id="zoomInBtn" class="btn">+</button>
+        <button id="zoomFitBtn" class="btn">Fit</button>
+        <span id="zoomLabel" class="counter">100%</span>
+      </div>
+
+      <div class="canvas-wrap" id="canvasWrap">
+        <canvas id="annotCanvas" tabindex="0"></canvas>
+      </div>
+
+      <div id="statusBar" class="status">No dataset loaded.</div>
+    </main>
+
+    <aside class="panel panel-right">
+      <h2>Inspector</h2>
+
+      <div class="button-row">
+        <button id="quickPredictBtn" class="btn">Auto-label</button>
+        <button id="quickSaveBtn" class="btn btn-primary">Save</button>
+      </div>
+
+      <div class="button-row">
+        <button id="quickPrevBtn" class="btn">Prev</button>
+        <button id="quickNextBtn" class="btn">Next</button>
+      </div>
+
+      <label class="input-group">
+        <span>Class for selected/new box</span>
+        <select id="classSelect"></select>
+      </label>
+
+      <div class="button-row">
+        <button id="deleteBtn" class="btn btn-danger">Delete Box</button>
+        <button id="clearBtn" class="btn">Clear Image</button>
+      </div>
+
+      <div class="box-list-wrap">
+        <div class="box-list-title">Boxes</div>
+        <ul id="boxList" class="box-list"></ul>
+      </div>
+
+      <div class="hint hotkeys">
+        <div><strong>Hotkeys</strong></div>
+        <div><code>Ctrl+S</code> Save</div>
+        <div><code>Ctrl+Shift+S</code> Save All</div>
+        <div><code>P</code> Auto-label</div>
+        <div><code>Ctrl+C / Ctrl+V</code> Copy/Paste box</div>
+        <div><code>Left/Right</code> Prev/Next image</div>
+        <div><code>Ctrl+Z</code> Undo</div>
+        <div><code>+ / -</code> Zoom</div>
+        <div><code>0</code> Fit zoom</div>
+        <div><code>Right click</code> Class menu</div>
+      </div>
+    </aside>
+  </div>
+
+  <div id="pickerModal" class="picker-modal hidden">
+    <div class="picker-window">
+      <div class="picker-header">
+        <div id="pickerTitle" class="picker-title">Select path</div>
+        <button id="pickerCloseBtn" class="btn">Close</button>
+      </div>
+      <div class="picker-controls">
+        <button id="pickerRootsBtn" class="btn">Roots</button>
+        <button id="pickerUpBtn" class="btn">Up</button>
+        <button id="pickerSelectCurrentBtn" class="btn btn-primary">Select Current Folder</button>
+      </div>
+      <div id="pickerPath" class="picker-path"></div>
+      <ul id="pickerList" class="picker-list"></ul>
+    </div>
+  </div>
+
+  <div id="classContextMenu" class="class-menu hidden"></div>
+
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

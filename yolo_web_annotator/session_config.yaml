@@ -1,0 +1,38 @@
+dataset_dir: C:\Users\ander\Desktop\Projects\Work\ISO_6346_recognition\datasets\dataset_19_02_26
+model_path: C:\Users\ander\Desktop\Projects\Work\ISO_6346_recognition\model_06_02_26_250e.pt
+classes:
+  - "0"
+  - "1"
+  - "2"
+  - "3"
+  - "4"
+  - "5"
+  - "6"
+  - "7"
+  - "8"
+  - "9"
+  - A
+  - B
+  - C
+  - D
+  - E
+  - F
+  - G
+  - H
+  - I
+  - J
+  - K
+  - L
+  - M
+  - N
+  - O
+  - P
+  - R
+  - S
+  - T
+  - U
+  - V
+  - W
+  - X
+  - Y
+  - Z
