@@ -1,0 +1,52 @@
+sudo nano ~/.docker/config.json
+
+Добавьте:
+
+{
+ "proxies":
+ {
+   "default":
+   {
+     "httpProxy": "http://AndreevAiva:S@shok210370@cksfpwg.npr.nornick.ru:3128",
+     "httpsProxy": "http://AndreevAiva:S@shok210370@cksfpwg.npr.nornick.ru:3128"
+   }
+ }
+}
+2️⃣ Прокси для apt внутри контейнеров (часто требуется)
+
+Если контейнеры Debian/Ubuntu:
+
+sudo nano /etc/apt/apt.conf.d/proxy.conf
+Acquire::http::Proxy "http://AndreevAiva:S@shok210370@cksfpwg.npr.nornick.ru:3128";
+Acquire::https::Proxy "http://AndreevAiva:S@shok210370@cksfpwg.npr.nornick.ru:3128";
+🔎 Проверка работы прокси
+1️⃣ Проверить прокси на системе
+curl -x http://AndreevAiva:S@shok210370@cksfpwg.npr.nornick.ru:3128 https://google.com
+
+Если всё работает — получите HTML страницу.
+
+2️⃣ Проверить Docker pull
+docker pull hello-world
+
+Если прокси работает — образ скачивается.
+
+3️⃣ Проверить интернет внутри контейнера
+docker run -it alpine sh
+
+В контейнере:
+
+apk add curl
+curl https://google.com
+
+✅ Быстрая проверка Docker-прокси:
+
+systemctl show docker | grep -i proxy
+
+⚠️ Важно:
+В вашем пароле есть символ @. Иногда Docker его ломает. Тогда нужно писать так:
+
+S%40shok210370
+
+пример:
+
+http://AndreevAiva:S%40shok210370@cksfpwg.npr.nornick.ru:3128
