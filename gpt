@@ -50,3 +50,44 @@ S%40shok210370
 пример:
 
 http://AndreevAiva:S%40shok210370@cksfpwg.npr.nornick.ru:3128
+
+
+1️⃣ Скачать сертификат через прокси
+openssl s_client -connect registry-1.docker.io:443 \
+-proxy cksfpwg.npr.nornick.ru:3128 \
+-showcerts </dev/null 2>/dev/null \
+| openssl x509 -outform PEM > corp-proxy.crt
+
+Появится файл:
+
+corp-proxy.crt
+
+Проверка:
+
+openssl x509 -in corp-proxy.crt -text -noout
+2️⃣ Добавить сертификат в систему
+sudo cp corp-proxy.crt /usr/local/share/ca-certificates/
+sudo update-ca-certificates
+3️⃣ Добавить сертификат для Docker
+sudo mkdir -p /etc/docker/certs.d/registry-1.docker.io
+sudo cp corp-proxy.crt /etc/docker/certs.d/registry-1.docker.io/ca.crt
+4️⃣ Перезапустить Docker
+sudo systemctl restart docker
+5️⃣ Проверить
+docker pull hello-world
+🔎 Очень полезная диагностика (покажет сразу проблему)
+docker info | grep -i proxy
+
+и
+
+curl -v https://registry-1.docker.io
+
+💡 Практический совет (очень важно для Astra + корпоративных сетей):
+
+Иногда Docker начинает работать намного стабильнее, если добавить:
+
+NO_PROXY=localhost,127.0.0.1,registry-1.docker.io
+
+в файл:
+
+/etc/systemd/system/docker.service.d/http-proxy.conf
