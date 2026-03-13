@@ -1,93 +1,36 @@
-sudo nano ~/.docker/config.json
+mkdir -p /opt/docker-images
 
-Добавьте:
+podman pull docker://pytorch/pytorch:2.7.1-cuda11.8-cudnn9-runtime
+podman pull docker://python:3.11-slim
+podman pull docker://node:20-alpine
+podman pull docker://nginx:alpine
+podman pull docker://postgres:15
+podman pull docker://minio/minio:latest
+podman pull docker://vllm/vllm-openai:latest
+2) Сохранить в формат, совместимый с Docker
 
-{
- "proxies":
- {
-   "default":
-   {
-     "httpProxy": "http://AndreevAiva:S@shok210370@cksfpwg.npr.nornick.ru:3128",
-     "httpsProxy": "http://AndreevAiva:S@shok210370@cksfpwg.npr.nornick.ru:3128"
-   }
- }
-}
-2️⃣ Прокси для apt внутри контейнеров (часто требуется)
+bash
 
-Если контейнеры Debian/Ubuntu:
+podman save --format docker-archive -o /opt/docker-images/pytorch.tar pytorch/pytorch:2.7.1-cuda11.8-cudnn9-runtime
+podman save --format docker-archive -o /opt/docker-images/python311.tar python:3.11-slim
+podman save --format docker-archive -o /opt/docker-images/node20.tar node:20-alpine
+podman save --format docker-archive -o /opt/docker-images/nginx.tar nginx:alpine
+podman save --format docker-archive -o /opt/docker-images/postgres15.tar postgres:15
+podman save --format docker-archive -o /opt/docker-images/minio.tar minio/minio:latest
+podman save --format docker-archive -o /opt/docker-images/vllm.tar vllm/vllm-openai:latest
+3) Загрузить в Docker
 
-sudo nano /etc/apt/apt.conf.d/proxy.conf
-Acquire::http::Proxy "http://AndreevAiva:S@shok210370@cksfpwg.npr.nornick.ru:3128";
-Acquire::https::Proxy "http://AndreevAiva:S@shok210370@cksfpwg.npr.nornick.ru:3128";
-🔎 Проверка работы прокси
-1️⃣ Проверить прокси на системе
-curl -x http://AndreevAiva:S@shok210370@cksfpwg.npr.nornick.ru:3128 https://google.com
+bash
 
-Если всё работает — получите HTML страницу.
+docker load -i /opt/docker-images/pytorch.tar
+docker load -i /opt/docker-images/python311.tar
+docker load -i /opt/docker-images/node20.tar
+docker load -i /opt/docker-images/nginx.tar
+docker load -i /opt/docker-images/postgres15.tar
+docker load -i /opt/docker-images/minio.tar
+docker load -i /opt/docker-images/vllm.tar
+4) Проверка
 
-2️⃣ Проверить Docker pull
-docker pull hello-world
+bash
 
-Если прокси работает — образ скачивается.
-
-3️⃣ Проверить интернет внутри контейнера
-docker run -it alpine sh
-
-В контейнере:
-
-apk add curl
-curl https://google.com
-
-✅ Быстрая проверка Docker-прокси:
-
-systemctl show docker | grep -i proxy
-
-⚠️ Важно:
-В вашем пароле есть символ @. Иногда Docker его ломает. Тогда нужно писать так:
-
-S%40shok210370
-
-пример:
-
-http://AndreevAiva:S%40shok210370@cksfpwg.npr.nornick.ru:3128
-
-
-1️⃣ Скачать сертификат через прокси
-openssl s_client -connect registry-1.docker.io:443 \
--proxy cksfpwg.npr.nornick.ru:3128 \
--showcerts </dev/null 2>/dev/null \
-| openssl x509 -outform PEM > corp-proxy.crt
-
-Появится файл:
-
-corp-proxy.crt
-
-Проверка:
-
-openssl x509 -in corp-proxy.crt -text -noout
-2️⃣ Добавить сертификат в систему
-sudo cp corp-proxy.crt /usr/local/share/ca-certificates/
-sudo update-ca-certificates
-3️⃣ Добавить сертификат для Docker
-sudo mkdir -p /etc/docker/certs.d/registry-1.docker.io
-sudo cp corp-proxy.crt /etc/docker/certs.d/registry-1.docker.io/ca.crt
-4️⃣ Перезапустить Docker
-sudo systemctl restart docker
-5️⃣ Проверить
-docker pull hello-world
-🔎 Очень полезная диагностика (покажет сразу проблему)
-docker info | grep -i proxy
-
-и
-
-curl -v https://registry-1.docker.io
-
-💡 Практический совет (очень важно для Astra + корпоративных сетей):
-
-Иногда Docker начинает работать намного стабильнее, если добавить:
-
-NO_PROXY=localhost,127.0.0.1,registry-1.docker.io
-
-в файл:
-
-/etc/systemd/system/docker.service.d/http-proxy.conf
+docker images | grep -E "pytorch|python|node|nginx|postgres|mini
