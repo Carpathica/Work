@@ -2,31 +2,24 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
 import json
 import mimetypes
 import os
 import time
+import uuid
 from collections import Counter
-from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
-
-import httpx
+from typing import Any, Dict, List, Optional, Tuple
+from urllib import error, request
 
 
 TARGET_FIELDS = ("owner_code", "registration_number", "check_digit", "type_size_code")
 
 
 def normalize_text(value: Any) -> str:
-    """
-    Copy the same normalization idea as release-demo's testing/vlm_eval.py.
-    """
     if value is None:
         return ""
     text = str(value).upper()
-    # Drop spaces and separators that commonly appear in OCR/VLM outputs.
     return "".join(ch for ch in text if ch.isalnum())
 
 
@@ -35,12 +28,6 @@ def normalize_fields(fields: Dict[str, Any]) -> Dict[str, str]:
 
 
 def parse_fields(value: Any) -> Dict[str, str]:
-    """
-    VLM response may be:
-    - dict with keys owner_code/registration_number/...
-    - list of {label, text} objects
-    - wrapper dict with nested 'result'
-    """
     if isinstance(value, dict):
         return normalize_fields(value)
     if isinstance(value, list):
@@ -55,10 +42,18 @@ def parse_fields(value: Any) -> Dict[str, str]:
     return normalize_fields({})
 
 
-def load_cases(dataset_path: Path, max_cases: int, default_scenario: str) -> List[dict[str, Any]]:
+def iso_from_fields(fields: Dict[str, str]) -> str:
+    return (
+        f"{fields.get('owner_code', '')}"
+        f"{fields.get('registration_number', '')}"
+        f"{fields.get('check_digit', '')}"
+    ).strip()
+
+
+def load_cases(dataset_path: Path, max_samples: int, default_scenario: str) -> List[Dict[str, Any]]:
     dataset_dir = dataset_path.parent.resolve()
     rows = dataset_path.read_text(encoding="utf-8").splitlines()
-    cases: List[dict[str, Any]] = []
+    cases: List[Dict[str, Any]] = []
 
     for index, line in enumerate(rows, start=1):
         if not line.strip():
@@ -75,11 +70,11 @@ def load_cases(dataset_path: Path, max_cases: int, default_scenario: str) -> Lis
 
         image_refs = raw.get("images", raw.get("image"))
         if image_refs is None:
-            raise ValueError(f"{case_id}: no image(s) in dataset entry.")
+            continue
         if isinstance(image_refs, str):
             image_refs = [image_refs]
         if not isinstance(image_refs, list):
-            raise ValueError(f"{case_id}: invalid image(s) type.")
+            continue
 
         image_paths: List[Path] = []
         for ref in image_refs:
@@ -99,7 +94,6 @@ def load_cases(dataset_path: Path, max_cases: int, default_scenario: str) -> Lis
         cases.append(
             {
                 "case_id": case_id,
-                "scenario": scenario,
                 "metadata": metadata,
                 "image_paths": image_paths,
                 "expected": expected,
@@ -107,256 +101,288 @@ def load_cases(dataset_path: Path, max_cases: int, default_scenario: str) -> Lis
             }
         )
 
-        if max_cases > 0 and len(cases) >= max_cases:
+        if max_samples > 0 and len(cases) >= max_samples:
             break
 
-    if not cases:
-        raise RuntimeError("Dataset is empty or no valid rows loaded.")
     return cases
 
 
-@dataclass
-class ImagePayload:
-    name: str
-    content: bytes
-    mime_type: str
+def http_json_post(
+    url: str,
+    payload: Dict[str, Any],
+    timeout: float,
+    headers: Optional[Dict[str, str]] = None,
+) -> Tuple[int, Dict[str, Any]]:
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req_headers = {"Content-Type": "application/json"}
+    if headers:
+        req_headers.update(headers)
+
+    req = request.Request(url=url, data=body, headers=req_headers, method="POST")
+    try:
+        with request.urlopen(req, timeout=timeout) as resp:
+            status = int(resp.status)
+            content = resp.read().decode("utf-8", errors="replace")
+            data = json.loads(content) if content else {}
+            return status, data
+    except error.HTTPError as exc:
+        content = exc.read().decode("utf-8", errors="replace")
+        try:
+            data = json.loads(content) if content else {}
+        except Exception:
+            data = {"raw": content}
+        return int(exc.code), data
 
 
-def load_image_payload(path: Path) -> ImagePayload:
-    if not path.exists():
-        raise FileNotFoundError(f"Image not found: {path}")
-    mime_type, _ = mimetypes.guess_type(str(path))
-    return ImagePayload(
-        name=path.name,
-        content=path.read_bytes(),
-        mime_type=mime_type or "application/octet-stream",
+def build_multipart_body(
+    metadata_json: str,
+    images: List[Path],
+) -> Tuple[bytes, str]:
+    boundary = f"----ReleaseDemoBoundary{uuid.uuid4().hex}"
+    chunks: List[bytes] = []
+
+    def add_line(value: str) -> None:
+        chunks.append(value.encode("utf-8"))
+
+    add_line(f"--{boundary}\r\n")
+    add_line('Content-Disposition: form-data; name="metadata"\r\n')
+    add_line("Content-Type: text/plain; charset=utf-8\r\n\r\n")
+    add_line(metadata_json)
+    add_line("\r\n")
+
+    for image_path in images:
+        filename = image_path.name
+        mime_type, _ = mimetypes.guess_type(str(image_path))
+        content_type = mime_type or "application/octet-stream"
+        data = image_path.read_bytes()
+
+        add_line(f"--{boundary}\r\n")
+        add_line(
+            f'Content-Disposition: form-data; name="files"; filename="{filename}"\r\n'
+        )
+        add_line(f"Content-Type: {content_type}\r\n\r\n")
+        chunks.append(data)
+        add_line("\r\n")
+
+    add_line(f"--{boundary}--\r\n")
+    body = b"".join(chunks)
+    content_type = f"multipart/form-data; boundary={boundary}"
+    return body, content_type
+
+
+def http_multipart_post(
+    url: str,
+    metadata_json: str,
+    images: List[Path],
+    timeout: float,
+    bearer_token: str,
+) -> Tuple[int, Dict[str, Any]]:
+    body, content_type = build_multipart_body(metadata_json, images)
+    headers = {
+        "Content-Type": content_type,
+        "Authorization": f"Bearer {bearer_token}",
+    }
+    req = request.Request(url=url, data=body, headers=headers, method="POST")
+
+    try:
+        with request.urlopen(req, timeout=timeout) as resp:
+            status = int(resp.status)
+            content = resp.read().decode("utf-8", errors="replace")
+            data = json.loads(content) if content else {}
+            return status, data
+    except error.HTTPError as exc:
+        content = exc.read().decode("utf-8", errors="replace")
+        try:
+            data = json.loads(content) if content else {}
+        except Exception:
+            data = {"raw": content}
+        return int(exc.code), data
+
+
+def login(base_url: str, username: str, password: str, timeout: float) -> str:
+    status, data = http_json_post(
+        url=f"{base_url.rstrip('/')}/auth/login",
+        payload={"username": username, "password": password},
+        timeout=timeout,
     )
+    if status != 200:
+        raise RuntimeError(f"Login failed: HTTP {status}, body={data}")
+    token = data.get("access_token")
+    if not token:
+        raise RuntimeError("Login succeeded but no access_token in response.")
+    return str(token)
 
 
-def iso_from_expected_or_predicted(fields: Dict[str, str]) -> str:
-    return f"{fields.get('owner_code', '')}{fields.get('registration_number', '')}{fields.get('check_digit', '')}".strip()
-
-
-class ApiSession:
-    """
-    Minimal copy of release-demo/testing/vlm_eval.py ApiSession logic.
-    Uses /auth/login to fetch access token, then calls:
-      POST {base_url}/api/v1/recognize-multipart
-    """
-
-    def __init__(self, base_url: str, username: str, password: str) -> None:
-        self.base_url = base_url.rstrip("/")
-        self.username = username
-        self.password = password
-        self._access_token: Optional[str] = None
-        self._login_lock = asyncio.Lock()
-
-    async def login(self, client: httpx.AsyncClient) -> None:
-        response = await client.post(
-            f"{self.base_url}/auth/login",
-            json={"username": self.username, "password": self.password},
-        )
-        response.raise_for_status()
-        payload = response.json()
-        token = payload.get("access_token")
-        if not token:
-            raise RuntimeError("Login succeeded but no access_token in response.")
-        self._access_token = token
-
-    async def _ensure_token(self, client: httpx.AsyncClient) -> None:
-        if self._access_token:
-            return
-        async with self._login_lock:
-            if not self._access_token:
-                await self.login(client)
-
-    async def recognize_multipart(
-        self,
-        *,
-        client: httpx.AsyncClient,
-        images: List[ImagePayload],
-        metadata_json: str,
-    ) -> httpx.Response:
-        await self._ensure_token(client)
-        headers = {"Authorization": f"Bearer {self._access_token}"}
-        files = [("files", (image.name, image.content, image.mime_type)) for image in images]
-
-        response = await client.post(
-            f"{self.base_url}/api/v1/recognize-multipart",
-            headers=headers,
-            data={"metadata": metadata_json},
-            files=files,
-        )
-
-        # Retry on token expiration (401) like release-demo's test script does.
-        if response.status_code == 401:
-            await self.login(client)
-            headers = {"Authorization": f"Bearer {self._access_token}"}
-            response = await client.post(
-                f"{self.base_url}/api/v1/recognize-multipart",
-                headers=headers,
-                data={"metadata": metadata_json},
-                files=files,
-            )
-
-        return response
-
-
-def extract_predicted_fields(response_payload: dict[str, Any]) -> Dict[str, str]:
-    # release-demo returns: {"result": <scenario_result>, "request_id": ...}
-    # In some cases <scenario_result> is wrapped as {"result": <payload>, ...}
+def extract_predicted_fields(response_payload: Dict[str, Any]) -> Dict[str, str]:
     content: Any = response_payload.get("result", response_payload)
     if isinstance(content, dict) and "result" in content:
         content = content["result"]
     return parse_fields(content)
 
 
-async def async_main(args: argparse.Namespace) -> Dict[str, Any]:
-    dataset_path = Path(args.dataset).expanduser().resolve()
-    if not dataset_path.exists():
-        raise FileNotFoundError(f"Dataset not found: {dataset_path}")
-
-    cases = load_cases(
-        dataset_path=dataset_path,
-        max_cases=args.max_samples or 0,
-        default_scenario=args.default_scenario,
-    )
-
-    timeout = httpx.Timeout(args.timeout)
-    sem = asyncio.Semaphore(max(args.concurrency, 1))
-    api = ApiSession(args.base_url, args.username, args.password)
-
-    started_at = datetime.now(timezone.utc)
-    rows: List[Dict[str, Any]] = []
-    lock = asyncio.Lock()
-
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        await api.login(client)
-
-        async def run_one(case: dict[str, Any]) -> None:
-            async with sem:
-                started = time.perf_counter()
-                status_code = 0
-                error: Optional[str] = None
-                predicted = parse_fields({})
-                predicted_iso = ""
-
-                try:
-                    images = [load_image_payload(p) for p in case["image_paths"]]
-                    metadata_json = json.dumps(case["metadata"], ensure_ascii=False)
-                    resp = await api.recognize_multipart(
-                        client=client, images=images, metadata_json=metadata_json
-                    )
-                    status_code = resp.status_code
-                    if resp.status_code != 200:
-                        error = f"http_{resp.status_code}"
-                    else:
-                        payload = resp.json()
-                        predicted = extract_predicted_fields(payload)
-                        predicted_iso = iso_from_expected_or_predicted(predicted)
-                except Exception as exc:  # noqa: BLE001
-                    error = type(exc).__name__
-
-                latency_ms = (time.perf_counter() - started) * 1000.0
-
-                gt_fields: Dict[str, str] = case["expected"]
-                gt_iso = iso_from_expected_or_predicted(gt_fields)
-                full_match = case["has_expected"] and (predicted.get("owner_code") == gt_fields["owner_code"]
-                                                       and predicted.get("registration_number") == gt_fields["registration_number"]
-                                                       and predicted.get("check_digit") == gt_fields["check_digit"]
-                                                       and predicted.get("type_size_code") == gt_fields["type_size_code"])
-                iso_match = case["has_expected"] and predicted_iso.upper() == gt_iso.upper()
-
-                async with lock:
-                    rows.append(
-                        {
-                            "case_id": case["case_id"],
-                            "status_code": status_code,
-                            "error": error,
-                            "latency_ms": latency_ms,
-                            "expected": gt_fields,
-                            "predicted": predicted,
-                            "full_match": full_match if case["has_expected"] else None,
-                            "iso_match": iso_match if case["has_expected"] else None,
-                        }
-                    )
-
-        await asyncio.gather(*(run_one(case) for case in cases))
-
-    ended_at = datetime.now(timezone.utc)
-
-    scored = [r for r in rows if r.get("full_match") is not None]
-    scored_iso = [r for r in rows if r.get("iso_match") is not None]
-
-    full_correct = sum(1 for r in scored if r["full_match"])
-    iso_correct = sum(1 for r in scored_iso if r["iso_match"])
-
-    # Field-wise accuracies (only where expected exists)
-    field_accuracy: Dict[str, Optional[float]] = {}
-    for field in TARGET_FIELDS:
-        hits = sum(1 for r in scored if r["predicted"].get(field) == r["expected"].get(field))
-        field_accuracy[field] = (hits / len(scored)) if scored else None
-
-    status_counts = Counter(r["status_code"] for r in rows)
-    avg_latency = (sum(r["latency_ms"] for r in rows) / len(rows)) if rows else None
-
-    return {
-        "dataset": str(dataset_path),
-        "samples_total": len(rows),
-        "samples_scored": len(scored),
-        "full_match_accuracy": (full_correct / len(scored)) if scored else 0.0,
-        "iso_accuracy": (iso_correct / len(scored_iso)) if scored_iso else 0.0,
-        "field_accuracy": field_accuracy,
-        "status_codes": {str(k): v for k, v in status_counts.items()},
-        "avg_latency_ms": avg_latency,
-        "started_at_utc": started_at.isoformat(),
-        "finished_at_utc": ended_at.isoformat(),
-        # Keep per-case results for debugging.
-        "rows": rows if args.debug_rows else [],
-    }
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=(
-            "Evaluate VLM via release-demo POST /api/v1/recognize-multipart and compute accuracy."
-        )
+        description="Evaluate release-demo VLM accuracy without external Python deps."
     )
-    parser.add_argument(
-        "--dataset",
-        required=True,
-        help="Path to dataset JSONL produced by build_release_style_dataset.py.",
-    )
+    parser.add_argument("--dataset", required=True, help="Path to dataset JSONL.")
     parser.add_argument(
         "--base-url",
         default=os.getenv("RELEASE_DEMO_BASE_URL") or "http://localhost:8899",
-        help="release-demo base URL (e.g. http://localhost:8899).",
+        help="release-demo base URL.",
     )
     parser.add_argument(
         "--username",
         default=os.getenv("RELEASE_DEMO_USERNAME") or "admin@example.com",
-        help="release-demo username (used for /auth/login).",
+        help="release-demo username.",
     )
     parser.add_argument(
         "--password",
         default=os.getenv("RELEASE_DEMO_PASSWORD") or "admin123@pass!",
-        help="release-demo password (used for /auth/login).",
+        help="release-demo password.",
     )
     parser.add_argument(
         "--default-scenario",
         default="extract_number_general",
-        help="Fallback scenario name if dataset row doesn't include it.",
+        help="Fallback scenario if row does not define scenario.",
     )
-    parser.add_argument("--timeout", type=float, default=120.0, help="HTTP timeout seconds.")
-    parser.add_argument("--concurrency", type=int, default=2, help="Parallel requests.")
-    parser.add_argument("--max-samples", type=int, default=None, help="Limit number of samples.")
+    parser.add_argument("--timeout", type=float, default=120.0, help="Request timeout seconds.")
+    parser.add_argument("--max-samples", type=int, default=0, help="Optional sample limit.")
     parser.add_argument("--debug-rows", action="store_true", help="Include per-case rows in output.")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    report = asyncio.run(async_main(args))
+    dataset_path = Path(args.dataset).expanduser().resolve()
+    if not dataset_path.exists():
+        raise FileNotFoundError(f"Dataset not found: {dataset_path}")
+
+    cases = load_cases(
+        dataset_path=dataset_path,
+        max_samples=max(int(args.max_samples), 0),
+        default_scenario=args.default_scenario,
+    )
+    if not cases:
+        raise RuntimeError("No valid cases in dataset.")
+
+    token = login(
+        base_url=args.base_url,
+        username=args.username,
+        password=args.password,
+        timeout=float(args.timeout),
+    )
+
+    started = time.time()
+    rows: List[Dict[str, Any]] = []
+
+    recognize_url = f"{args.base_url.rstrip('/')}/api/v1/recognize-multipart"
+
+    for idx, case in enumerate(cases, start=1):
+        sample_started = time.perf_counter()
+        status_code = 0
+        error_name: Optional[str] = None
+        predicted = parse_fields({})
+        request_id = None
+
+        try:
+            image_paths: List[Path] = case["image_paths"]
+            image_paths = [p for p in image_paths if p.exists()]
+            if not image_paths:
+                raise FileNotFoundError("No existing images for case.")
+
+            metadata_json = json.dumps(case["metadata"], ensure_ascii=False)
+            status_code, payload = http_multipart_post(
+                url=recognize_url,
+                metadata_json=metadata_json,
+                images=image_paths,
+                timeout=float(args.timeout),
+                bearer_token=token,
+            )
+
+            if status_code == 401:
+                token = login(
+                    base_url=args.base_url,
+                    username=args.username,
+                    password=args.password,
+                    timeout=float(args.timeout),
+                )
+                status_code, payload = http_multipart_post(
+                    url=recognize_url,
+                    metadata_json=metadata_json,
+                    images=image_paths,
+                    timeout=float(args.timeout),
+                    bearer_token=token,
+                )
+
+            if status_code == 200:
+                request_id = payload.get("request_id")
+                predicted = extract_predicted_fields(payload)
+            else:
+                error_name = f"http_{status_code}"
+        except Exception as exc:  # noqa: BLE001
+            error_name = type(exc).__name__
+
+        latency_ms = (time.perf_counter() - sample_started) * 1000.0
+
+        expected: Dict[str, str] = case["expected"]
+        expected_iso = iso_from_fields(expected)
+        predicted_iso = iso_from_fields(predicted)
+
+        has_expected = bool(case["has_expected"])
+        full_match = (
+            has_expected and all(predicted.get(field, "") == expected.get(field, "") for field in TARGET_FIELDS)
+        )
+        iso_match = has_expected and predicted_iso.upper() == expected_iso.upper()
+
+        rows.append(
+            {
+                "case_id": case["case_id"],
+                "status_code": status_code,
+                "request_id": request_id,
+                "error": error_name,
+                "latency_ms": latency_ms,
+                "expected": expected,
+                "predicted": predicted,
+                "full_match": full_match if has_expected else None,
+                "iso_match": iso_match if has_expected else None,
+            }
+        )
+        print(f"[{idx}/{len(cases)}] case={case['case_id']} status={status_code} error={error_name or 'none'}")
+
+    finished = time.time()
+
+    scored = [r for r in rows if r.get("full_match") is not None]
+    scored_iso = [r for r in rows if r.get("iso_match") is not None]
+    full_correct = sum(1 for r in scored if r["full_match"])
+    iso_correct = sum(1 for r in scored_iso if r["iso_match"])
+
+    field_accuracy: Dict[str, Optional[float]] = {}
+    for field in TARGET_FIELDS:
+        if not scored:
+            field_accuracy[field] = None
+        else:
+            hits = sum(1 for r in scored if r["predicted"].get(field) == r["expected"].get(field))
+            field_accuracy[field] = hits / len(scored)
+
+    latencies = [float(r["latency_ms"]) for r in rows]
+    avg_latency = (sum(latencies) / len(latencies)) if latencies else None
+    status_codes = Counter(int(r["status_code"]) for r in rows)
+
+    report = {
+        "dataset": str(dataset_path),
+        "samples_total": len(rows),
+        "samples_scored": len(scored),
+        "full_match_accuracy": (full_correct / len(scored)) if scored else 0.0,
+        "iso_accuracy": (iso_correct / len(scored_iso)) if scored_iso else 0.0,
+        "field_accuracy": field_accuracy,
+        "status_codes": {str(k): v for k, v in status_codes.items()},
+        "avg_latency_ms": avg_latency,
+        "started_at_unix": started,
+        "finished_at_unix": finished,
+        "duration_sec": finished - started,
+        "rows": rows if args.debug_rows else [],
+    }
+
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0
 
