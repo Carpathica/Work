@@ -1,0 +1,33 @@
+{
+  "interval_minutes": 20,
+  "weights": "runs/detect/model_8_05_26_278e_26m/best.pt",
+  "output_root": "datasets/axis_collected",
+  "state_file": "runs/axis_dual_collector_state.json",
+  "log_jsonl": "runs/axis_dual_collector.jsonl",
+  "min_detections": 6,
+  "save_single_camera_on_error": true,
+  "conf": 0.15,
+  "iou": 0.45,
+  "max_det": 300,
+  "merge_iou": 0.35,
+  "cameras": [
+    {
+      "name": "camera1",
+      "host": "192.168.1.50",
+      "path": "/axis-cgi/jpg/image.cgi",
+      "user": "USER1",
+      "password_env": "AXIS_CAMERA1_PASSWORD",
+      "auth": "auto",
+      "timeout_seconds": 15
+    },
+    {
+      "name": "camera2",
+      "host": "192.168.1.51",
+      "path": "/axis-cgi/jpg/image.cgi",
+      "user": "USER2",
+      "password_env": "AXIS_CAMERA2_PASSWORD",
+      "auth": "auto",
+      "timeout_seconds": 15
+    }
+  ]
+}
