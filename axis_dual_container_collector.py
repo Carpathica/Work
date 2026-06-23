@@ -212,6 +212,24 @@ def is_complete_number(value: str) -> bool:
     return len(value) == 11 and value[:4].isalpha() and value[4:].isdigit()
 
 
+def manual_duplicate_key(analyses: Sequence[Analysis]) -> str:
+    complete_numbers = sorted(
+        {
+            analysis.primary_number
+            for analysis in analyses
+            if is_complete_number(analysis.primary_number)
+        }
+    )
+    if complete_numbers:
+        return "complete:" + "|".join(complete_numbers)
+
+    camera_numbers = [
+        f"{analysis.capture.camera.name}:{analysis.primary_number or '-'}"
+        for analysis in analyses
+    ]
+    return "raw:" + "|".join(camera_numbers)
+
+
 def load_state(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
@@ -226,6 +244,13 @@ def save_state(path: Path, state: dict[str, Any]) -> None:
     with path.open("w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
         f.write("\n")
+
+
+def update_state(path: Path, updates: dict[str, Any]) -> None:
+    state = load_state(path)
+    state.update(updates)
+    state["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    save_state(path, state)
 
 
 def append_log(path: Path, record: dict[str, Any]) -> None:
@@ -346,7 +371,13 @@ def save_pair(
     return saved
 
 
-def decide(analyses: Sequence[Analysis], *, min_detections: int, last_number: str | None) -> Decision:
+def decide(
+    analyses: Sequence[Analysis],
+    *,
+    min_detections: int,
+    last_number: str | None,
+    last_manual_key: str | None,
+) -> Decision:
     has_container = any(analysis.detections_count >= min_detections for analysis in analyses)
     if not has_container:
         return Decision("skip", "not_enough_detections", None, None)
@@ -357,6 +388,10 @@ def decide(analyses: Sequence[Analysis], *, min_detections: int, last_number: st
         if last_number and numbers[0] == last_number:
             return Decision("skip", "duplicate_accepted_number", numbers[0], None)
         return Decision("save", "accepted_number_match", numbers[0], "accepted")
+
+    manual_key = manual_duplicate_key(analyses)
+    if last_manual_key and manual_key == last_manual_key:
+        return Decision("skip", "duplicate_manual_case", None, None)
 
     return Decision("save", "manual_number_missing_or_mismatch", None, "manual")
 
@@ -488,6 +523,7 @@ def process_iteration(
         analyses,
         min_detections=min_detections,
         last_number=normalize_number(state.get("last_accepted_number")),
+        last_manual_key=str(state.get("last_manual_key") or ""),
     )
 
     saved: list[dict[str, str]] = []
@@ -500,11 +536,17 @@ def process_iteration(
             live_timestamp=live_timestamp,
         )
         if decision.category == "accepted" and decision.number:
-            save_state(
+            update_state(
                 state_path,
                 {
                     "last_accepted_number": decision.number,
-                    "updated_at": datetime.now().isoformat(timespec="seconds"),
+                },
+            )
+        elif decision.category == "manual":
+            update_state(
+                state_path,
+                {
+                    "last_manual_key": manual_duplicate_key(analyses),
                 },
             )
 
@@ -529,6 +571,7 @@ def process_single_camera_fallback(
     model: YOLO,
     class_ids: dict[str, int],
     output_root: Path,
+    state_path: Path,
     log_path: Path,
     min_detections: int,
     conf: float,
@@ -547,8 +590,13 @@ def process_single_camera_fallback(
         merge_iou=merge_iou,
     )
 
+    state = load_state(state_path)
+    manual_key = manual_duplicate_key(analyses)
     has_container = any(analysis.detections_count >= min_detections for analysis in analyses)
-    if has_container:
+    if has_container and manual_key == str(state.get("last_single_camera_manual_key") or ""):
+        decision = Decision("skip", "duplicate_single_camera_manual_case", None, None)
+        saved = []
+    elif has_container:
         decision = Decision("save", "single_camera_other_camera_error", None, "single_camera/manual")
         saved = save_pair(
             analyses,
@@ -556,6 +604,12 @@ def process_single_camera_fallback(
             output_root=output_root,
             class_ids=class_ids,
             live_timestamp=live_timestamp,
+        )
+        update_state(
+            state_path,
+            {
+                "last_single_camera_manual_key": manual_key,
+            },
         )
     else:
         decision = Decision("skip", "single_camera_not_enough_detections", None, None)
@@ -665,6 +719,7 @@ def main() -> int:
                             model=model,
                             class_ids=class_ids,
                             output_root=output_root,
+                            state_path=state_path,
                             log_path=log_path,
                             min_detections=min_detections,
                             conf=conf,
