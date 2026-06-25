@@ -103,6 +103,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable saving a useful single-camera manual sample when the other live camera fails.",
     )
+    parser.add_argument(
+        "--require-both-detections",
+        action="store_true",
+        help="Save a two-camera sample only when both images have at least min_detections.",
+    )
     return parser.parse_args()
 
 
@@ -230,6 +235,16 @@ def manual_duplicate_key(analyses: Sequence[Analysis]) -> str:
     return "raw:" + "|".join(camera_numbers)
 
 
+def has_check_ok_number(analysis: Analysis) -> bool:
+    return bool(analysis.read.check_ok)
+
+
+def manual_category(analyses: Sequence[Analysis]) -> str:
+    if any(has_check_ok_number(analysis) for analysis in analyses):
+        return "manual/recognized"
+    return "manual/unrecognized"
+
+
 def load_state(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
@@ -257,6 +272,43 @@ def append_log(path: Path, record: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def append_recognition_info(
+    *,
+    output_root: Path,
+    category: str,
+    live_timestamp: datetime | None,
+    analyses: Sequence[Analysis],
+    saved: Sequence[dict[str, str]],
+) -> None:
+    if category != "manual/recognized":
+        return
+
+    date_text = (live_timestamp or datetime.now()).date().isoformat()
+    info_path = output_root / category / date_text / "recognition_info.jsonl"
+    recognized = [
+        {
+            "camera": analysis.capture.camera.name,
+            "primary_number": analysis.primary_number,
+            "check_ok": bool(analysis.read.check_ok),
+            "detections_count": analysis.detections_count,
+            "saved_image": next(
+                (item["image"] for item in saved if item["camera"] == analysis.capture.camera.name),
+                None,
+            ),
+        }
+        for analysis in analyses
+        if has_check_ok_number(analysis)
+    ]
+    append_log(
+        info_path,
+        {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "recognized": recognized,
+            "all_cameras": [analysis_record(analysis) for analysis in analyses],
+        },
+    )
 
 
 def build_class_id_map(model: YOLO) -> dict[str, int]:
@@ -377,10 +429,13 @@ def decide(
     min_detections: int,
     last_number: str | None,
     last_manual_key: str | None,
+    require_both_detections: bool,
 ) -> Decision:
-    has_container = any(analysis.detections_count >= min_detections for analysis in analyses)
+    detections_ok = [analysis.detections_count >= min_detections for analysis in analyses]
+    has_container = all(detections_ok) if require_both_detections else any(detections_ok)
     if not has_container:
-        return Decision("skip", "not_enough_detections", None, None)
+        reason = "not_enough_detections_on_both_images" if require_both_detections else "not_enough_detections"
+        return Decision("skip", reason, None, None)
 
     numbers = [analysis.primary_number for analysis in analyses]
     both_complete = all(is_complete_number(number) for number in numbers)
@@ -393,7 +448,7 @@ def decide(
     if last_manual_key and manual_key == last_manual_key:
         return Decision("skip", "duplicate_manual_case", None, None)
 
-    return Decision("save", "manual_number_missing_or_mismatch", None, "manual")
+    return Decision("save", "manual_number_missing_or_mismatch", None, manual_category(analyses))
 
 
 def analyse_captures(
@@ -507,6 +562,7 @@ def process_iteration(
     iou: float,
     max_det: int,
     merge_iou: float | None,
+    require_both_detections: bool,
     mode: str,
     live_timestamp: datetime | None,
 ) -> Decision:
@@ -524,6 +580,7 @@ def process_iteration(
         min_detections=min_detections,
         last_number=normalize_number(state.get("last_accepted_number")),
         last_manual_key=str(state.get("last_manual_key") or ""),
+        require_both_detections=require_both_detections,
     )
 
     saved: list[dict[str, str]] = []
@@ -542,7 +599,14 @@ def process_iteration(
                     "last_accepted_number": decision.number,
                 },
             )
-        elif decision.category == "manual":
+        elif decision.category and decision.category.startswith("manual/"):
+            append_recognition_info(
+                output_root=output_root,
+                category=decision.category,
+                live_timestamp=live_timestamp,
+                analyses=analyses,
+                saved=saved,
+            )
             update_state(
                 state_path,
                 {
@@ -652,6 +716,9 @@ def main() -> int:
     log_path = resolve_repo_path(args.log_jsonl or config.get("log_jsonl"), DEFAULT_LOG_JSONL)
     min_detections = int(args.min_detections or config.get("min_detections", 6))
     interval_minutes = float(args.interval_minutes or config.get("interval_minutes", 20.0))
+    require_both_detections = bool(config.get("require_both_detections", False))
+    if args.require_both_detections:
+        require_both_detections = True
     conf = float(config.get("conf", 0.15))
     iou = float(config.get("iou", 0.45))
     max_det = int(config.get("max_det", 300))
@@ -678,6 +745,7 @@ def main() -> int:
             iou=iou,
             max_det=max_det,
             merge_iou=merge_iou,
+            require_both_detections=require_both_detections,
             mode="local",
             live_timestamp=None,
         )
@@ -710,6 +778,7 @@ def main() -> int:
                             iou=iou,
                             max_det=max_det,
                             merge_iou=merge_iou,
+                            require_both_detections=require_both_detections,
                             mode="live",
                             live_timestamp=live_timestamp,
                         )
@@ -750,6 +819,7 @@ def main() -> int:
                         iou=iou,
                         max_det=max_det,
                         merge_iou=merge_iou,
+                        require_both_detections=require_both_detections,
                         mode="live",
                         live_timestamp=live_timestamp,
                     )

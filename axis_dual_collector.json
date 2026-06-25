@@ -5,6 +5,7 @@
   "state_file": "runs/axis_dual_collector_state.json",
   "log_jsonl": "runs/axis_dual_collector.jsonl",
   "min_detections": 6,
+  "require_both_detections": false,
   "save_single_camera_on_error": true,
   "conf": 0.15,
   "iou": 0.45,
