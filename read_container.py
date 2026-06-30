@@ -31,6 +31,8 @@ OUTLIER_MAX_NEAREST_NEIGHBOR_FACTOR = 4.0
 _AUX_SIZE_TYPE_4 = re.compile(r"^[0-9]{2}[A-Z0-9][0-9]$")
 # Вариант с двумя буквами в конце
 _AUX_SIZE_TYPE_4_LETTERS = re.compile(r"^[0-9]{2}[A-Z]{1,2}$")
+# ISO 6346: 3 буквы владельца + категория оборудования U/J/Z + 6 цифр + check digit
+_ISO_OWNER_SERIAL = re.compile(r"^[A-Z]{3}[UJZ][0-9]{7}$")
 
 
 # Проверить, похожа ли строка на код типа контейнера (2–5 символов, не только цифры)
@@ -161,6 +163,10 @@ def iso6346_check_valid(full: str) -> bool:
     return full[10].isdigit() and int(full[10]) == expected
 
 
+def iso6346_number_format_valid(full: str) -> bool:
+    return bool(_ISO_OWNER_SERIAL.fullmatch(_normalize_text(full)))
+
+
 # Сортировка сверху вниз; при близком y — слева направо
 def sort_vertical_reading_order(detections: Iterable[Detection]) -> list[Detection]:
     return sorted(detections, key=lambda d: (d.cy, d.cx))
@@ -245,7 +251,8 @@ def _join_labels(dets: Iterable[Detection], *, normalized: bool = False) -> str:
 
 # Строка длиной 11 и проходит проверку ISO 6346
 def _is_valid_iso_text(text: str) -> bool:
-    return len(text) == 11 and iso6346_check_valid(text)
+    text = _normalize_text(text)
+    return len(text) == 11 and iso6346_number_format_valid(text) and iso6346_check_valid(text)
 
 
 # Высота и ширина бокса в пикселях
@@ -709,7 +716,7 @@ def _pick_cluster_representatives_for_reading(
             )
         ordered = sort_vertical_reading_order(tmp)
         text = "".join(d.label for d in ordered)
-        ok = iso6346_check_valid(text) if len(text) == 11 else False
+        ok = _is_valid_iso_text(text)
         conf_sum = sum(conf_list[i] for i in combo)
         key = (1 if ok else 0, conf_sum)
         if key > best_key:
@@ -933,7 +940,7 @@ def _camera_primary_confidence(read: CameraRead) -> float:
 def _score_fused_text(text: str, conf_sum: float) -> tuple[int, float, int]:
     normalized = _normalize_text(text)
     score = 0
-    if len(normalized) == 11 and iso6346_check_valid(normalized):
+    if _is_valid_iso_text(normalized):
         score += 1000
     if len(normalized) == 11:
         score += 50
@@ -987,7 +994,7 @@ def _fuse_disputed_positions(
             best_key = key
             best_text = text
 
-    ok = len(best_text) == 11 and iso6346_check_valid(best_text)
+    ok = _is_valid_iso_text(best_text)
     return best_text[:11], ok, "char_fusion" if disputed else "char_agree"
 
 
@@ -1054,11 +1061,14 @@ def predict_container_with_layout(
     )
     if not results:
         return "", False, [], "vertical", None
-    return _result_to_ordered_detections(
+    text, ok, ordered, layout, size_type = _result_to_ordered_detections(
         results[0],
         model.names if hasattr(model, "names") else None,
         merge_iou,
     )
+    if not iso6346_number_format_valid(text):
+        return "", False, ordered, layout, size_type
+    return text, ok, ordered, layout, size_type
 
 
 # Распознать контейнер (без имени раскладки в кортеже)
@@ -1138,6 +1148,8 @@ def predict_camera_read(
     )
     scored_ordered = _match_scored_detections(ordered, scored)
     char_scores = _char_scores_for_primary(text, scored_ordered)
+    if not iso6346_number_format_valid(text):
+        return CameraRead(image_path, "", False, scored_ordered, size_type, layout, char_scores)
     return CameraRead(image_path, text, check_ok, scored_ordered, size_type, layout, char_scores)
 
 
