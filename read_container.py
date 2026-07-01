@@ -37,7 +37,7 @@ _ISO_OWNER_SERIAL = re.compile(r"^[A-Z]{3}[UJZ][0-9]{7}$")
 
 # Проверить, похожа ли строка на код типа контейнера (2–5 символов, не только цифры)
 def _is_aux_size_type_code(text: str) -> bool:
-    t = text.strip().upper()
+    t = _normalize_text(text)
     if len(t) < 2 or len(t) > 5:
         return False
     if not any(c.isalpha() for c in t):
@@ -99,6 +99,7 @@ class ContainerRead(NamedTuple):
     layout: str
 
 
+# Детекция с уверенностью модели; используется для слияния результатов с двух камер
 class ScoredDetection(NamedTuple):
     label: str
     cy: float
@@ -107,6 +108,7 @@ class ScoredDetection(NamedTuple):
     conf: float
 
 
+# Результат чтения одной камеры: номер, раскладка, порядок символов и confidence по символам
 class CameraRead(NamedTuple):
     image_path: Path
     primary_number: str
@@ -117,6 +119,7 @@ class CameraRead(NamedTuple):
     char_scores: list[tuple[str, float]]
 
 
+# Итоговое чтение пары камер с выбранной стратегией слияния
 class DualRead(NamedTuple):
     primary_number: str
     check_ok: bool
@@ -142,8 +145,23 @@ def _normalize_text(text: str) -> str:
     return text.strip().upper().replace(" ", "")
 
 
+# Извлечь валидный код типа контейнера из OCR-строки
+def _extract_size_type_code(value: str | None) -> str | None:
+    raw = _normalize_text(value or "")
+    if not raw:
+        return None
+    if _is_aux_size_type_code(raw):
+        return raw
+    for start in range(0, len(raw) - 4 + 1):
+        candidate = raw[start : start + 4]
+        if _is_aux_size_type_code(candidate):
+            return candidate
+    return None
+
+
 # Контрольная цифра ISO 6346 по первым 10 символам номера (0–9)
 def iso6346_check_digit(first_ten: str) -> int:
+    first_ten = _normalize_text(first_ten)
     if len(first_ten) != 10:
         raise ValueError("Нужно ровно 10 символов")
     total = sum(_char_value(first_ten[i]) * (2**i) for i in range(10))
@@ -163,6 +181,7 @@ def iso6346_check_valid(full: str) -> bool:
     return full[10].isdigit() and int(full[10]) == expected
 
 
+# Проверить структуру номера ISO 6346 без расчёта контрольной цифры
 def iso6346_number_format_valid(full: str) -> bool:
     return bool(_ISO_OWNER_SERIAL.fullmatch(_normalize_text(full)))
 
@@ -194,10 +213,10 @@ def split_distant_right_auxiliary(
         gap_cx = float(group_high[0].cx - group_low[-1].cx)
 
         orientations = (
-            (group_high, group_low, "aux_left"),
-            (group_low, group_high, "aux_right"),
+            (group_high, group_low),
+            (group_low, group_high),
         )
-        for main_group, aux_group, _tag in orientations:
+        for main_group, aux_group in orientations:
             ma, aa = len(main_group), len(aux_group)
             if aa < 2 or aa > 5 or ma < 10:
                 continue
@@ -223,7 +242,7 @@ def split_distant_right_auxiliary(
                 score += 200
             if len(main_txt) == 11:
                 score += 30
-            if re.fullmatch(r"[A-Z]{4}[0-9]{7}", main_txt):
+            if iso6346_number_format_valid(main_txt):
                 score += 150
             score += min(int(max(gap_cx, 0.0)), 80)
 
@@ -304,7 +323,7 @@ def sort_horizontal_one_line(dets: Iterable[Detection]) -> list[Detection]:
 
 # 4 буквы владельца слева и 7 символов справа (раскладка split_owner_four)
 def try_split_owner_four(dets: list[Detection]) -> tuple[list[Detection], str] | None:
-    if len(dets) < 8:
+    if len(dets) < 11:
         return None
     s = sort_horizontal_one_line(dets)
     widths = [_det_hw(d)[1] for d in s]
@@ -409,7 +428,7 @@ def _reading_from_vertical_two_columns(
         score = 300
         if aux_stripped and _is_aux_size_type_code(aux_stripped):
             score += 200
-        if re.fullmatch(r"[A-Z]{4}[0-9]{7}", main_s):
+        if iso6346_number_format_valid(main_s):
             score += 150
         if best is None or score > best[0]:
             best = (
@@ -424,26 +443,6 @@ def _reading_from_vertical_two_columns(
         return None
     _, primary, st, main_ordered, aux_ordered = best
     ordered = main_ordered + aux_ordered
-    return primary, True, ordered, st
-
-
-# Две строки: номер и код типа контейнера (horizontal_two)
-def _reading_from_horizontal_two_lines(
-    dets: list[Detection],
-) -> tuple[str, bool, list[Detection], str | None] | None:
-    lines = cluster_detections_into_lines(dets)
-    if len(lines) != 2:
-        return None
-    s0 = _join_labels(lines[0], normalized=True)
-    s1 = _join_labels(lines[1], normalized=True)
-    primary, code_line = _pick_primary_iso_from_two_lines(s0, s1)
-    primary = _normalize_text(primary)
-    st = _normalize_text(code_line or "") or None
-    if not _is_valid_iso_text(primary):
-        return None
-    if st and not _is_aux_size_type_code(st):
-        return None
-    ordered = _ordered_two_lines(lines)
     return primary, True, ordered, st
 
 
@@ -470,7 +469,7 @@ def _layout_candidate_score(
         "horizontal_one": 100,
         "vertical": 0,
     }.get(layout, 0)
-    if re.fullmatch(r"[A-Z]{4}[0-9]{7}", text):
+    if iso6346_number_format_valid(text):
         score += 150
     return score
 
@@ -496,8 +495,8 @@ def _merge_size_type_code(
     from_layout: str | None,
     from_right_split: str | None,
 ) -> str | None:
-    a = _normalize_text(from_layout or "") or None
-    b = _normalize_text(from_right_split or "") or None
+    a = _extract_size_type_code(from_layout)
+    b = _extract_size_type_code(from_right_split)
     if layout in ("horizontal_two", "horizontal_three", "vertical_two_columns"):
         return a or b
     return b or a
@@ -650,17 +649,21 @@ def _greedy_iou_suppress_same_label(
 
 
 # Сгруппировать индексы боксов с IoU выше порога
-def _cluster_indices_by_iou(indices: list[int], xyxy_list: list[tuple[float, float, float, float]], iou_thresh: float) -> list[list[int]]:
+def _cluster_indices_by_iou(
+    indices: list[int],
+    xyxy_list: list[tuple[float, float, float, float]],
+    iou_thresh: float,
+) -> list[list[int]]:
     parent = {i: i for i in indices}
 
-# Найти корень в системе непересекающихся множеств (union-find)
+    # Найти корень в системе непересекающихся множеств (union-find)
     def find(x: int) -> int:
         while parent[x] != x:
             parent[x] = parent[parent[x]]
             x = parent[x]
         return x
 
-# Объединить два множества (union-find)
+    # Объединить два множества (union-find)
     def union(a: int, b: int) -> None:
         ra, rb = find(a), find(b)
         if ra != rb:
@@ -700,7 +703,7 @@ def _pick_cluster_representatives_for_reading(
         return [c[0] for c in choice_lists]
 
     best_pick: list[int] | None = None
-    best_key = (-1, -1.0)
+    best_key = (-1, -1, -1.0)
 
     for combo in product(*choice_lists):
         tmp: list[Detection] = []
@@ -714,11 +717,9 @@ def _pick_cluster_representatives_for_reading(
                     xyxy=(x1, y1, x2, y2),
                 )
             )
-        ordered = sort_vertical_reading_order(tmp)
-        text = "".join(d.label for d in ordered)
-        ok = _is_valid_iso_text(text)
+        text, ok, _ordered, _layout, _size_type = pick_best_reading_with_extra_layouts(tmp)
         conf_sum = sum(conf_list[i] for i in combo)
-        key = (1 if ok else 0, conf_sum)
+        key = (1 if ok else 0, 1 if len(text) == 11 else 0, conf_sum)
         if key > best_key:
             best_key = key
             best_pick = list(combo)
@@ -743,14 +744,14 @@ def filter_spatial_outlier_detections(
     n = len(dets)
     parent = list(range(n))
 
-# Найти корень в системе непересекающихся множеств (union-find)
+    # Найти корень в системе непересекающихся множеств (union-find)
     def find(x: int) -> int:
         while parent[x] != x:
             parent[x] = parent[parent[x]]
             x = parent[x]
         return x
 
-# Объединить два множества (union-find)
+    # Объединить два множества (union-find)
     def union(a: int, b: int) -> None:
         ra, rb = find(a), find(b)
         if ra != rb:
@@ -771,17 +772,28 @@ def filter_spatial_outlier_detections(
     return dets
 
 
-# Преобразовать результат YOLO в список Detection (merge IoU, фильтр выбросов)
-def _detections_from_result(
+# Вернуть имя класса YOLO с безопасным fallback на числовой id
+def _label_from_class_id(names: dict | list | None, cls_id: int) -> str:
+    if isinstance(names, dict):
+        return str(names.get(cls_id, cls_id))
+    if names is not None:
+        try:
+            return str(names[cls_id])
+        except (IndexError, KeyError, TypeError):
+            return str(cls_id)
+    return str(cls_id)
+
+
+# Достать bbox, confidence и label из результата YOLO
+def _raw_detection_fields_from_result(
     r0,
     model_names: dict | list | None,
-    merge_iou: float | None,
-) -> list[Detection]:
+) -> tuple[list[tuple[float, float, float, float]], list[float], list[str]]:
     boxes = r0.boxes
     if boxes is None or len(boxes) == 0:
-        return []
+        return [], [], []
 
-    names = r0.names or model_names
+    names = getattr(r0, "names", None) or model_names
     xyxy_all = boxes.xyxy.cpu().numpy()
     cls_all = boxes.cls.cpu().numpy().astype(int)
     conf_all = boxes.conf.cpu().numpy()
@@ -793,17 +805,33 @@ def _detections_from_result(
         x1, y1, x2, y2 = xyxy_all[i]
         xyxy_list.append((float(x1), float(y1), float(x2), float(y2)))
         conf_list.append(float(conf_all[i]))
-        cls_id = int(cls_all[i])
-        if isinstance(names, dict):
-            label_list.append(str(names.get(cls_id, cls_id)))
-        else:
-            label_list.append(str(names[cls_id]))
+        label_list.append(_label_from_class_id(names, int(cls_all[i])))
 
+    return xyxy_list, conf_list, label_list
+
+
+# Выбрать индексы после post-processing; merge_iou <= 0 отключает слияние
+def _postprocessed_detection_indices(
+    xyxy_list: list[tuple[float, float, float, float]],
+    conf_list: list[float],
+    label_list: list[str],
+    merge_iou: float | None,
+) -> list[int]:
     indices = list(range(len(xyxy_list)))
-    if merge_iou is not None and len(indices) > 1:
+    if merge_iou is not None and merge_iou > 0 and len(indices) > 1:
         indices = _greedy_iou_suppress_same_label(xyxy_list, conf_list, label_list, merge_iou)
         indices = _pick_cluster_representatives_for_reading(indices, xyxy_list, conf_list, label_list, merge_iou)
+    return indices
 
+
+# Преобразовать результат YOLO в список Detection (merge IoU, фильтр выбросов)
+def _detections_from_result(
+    r0,
+    model_names: dict | list | None,
+    merge_iou: float | None,
+) -> list[Detection]:
+    xyxy_list, conf_list, label_list = _raw_detection_fields_from_result(r0, model_names)
+    indices = _postprocessed_detection_indices(xyxy_list, conf_list, label_list, merge_iou)
     dets: list[Detection] = []
     for i in indices:
         label = label_list[i]
@@ -814,45 +842,24 @@ def _detections_from_result(
     return filter_spatial_outlier_detections(dets)
 
 
+# Отбросить confidence и оставить только геометрию/label
 def _to_detection(d: ScoredDetection) -> Detection:
     return Detection(d.label, d.cy, d.cx, d.xyxy)
 
 
+# Вернуть confidence в Detection после геометрической фильтрации
 def _scored_from_detection(d: Detection, conf: float) -> ScoredDetection:
     return ScoredDetection(d.label, d.cy, d.cx, d.xyxy, conf)
 
 
+# Преобразовать результат YOLO в ScoredDetection с тем же post-processing
 def _scored_detections_from_result(
     r0,
     model_names: dict | list | None,
     merge_iou: float | None,
 ) -> list[ScoredDetection]:
-    boxes = r0.boxes
-    if boxes is None or len(boxes) == 0:
-        return []
-
-    names = r0.names or model_names
-    xyxy_all = boxes.xyxy.cpu().numpy()
-    cls_all = boxes.cls.cpu().numpy().astype(int)
-    conf_all = boxes.conf.cpu().numpy()
-
-    xyxy_list: list[tuple[float, float, float, float]] = []
-    conf_list: list[float] = []
-    label_list: list[str] = []
-    for i in range(len(boxes)):
-        x1, y1, x2, y2 = xyxy_all[i]
-        xyxy_list.append((float(x1), float(y1), float(x2), float(y2)))
-        conf_list.append(float(conf_all[i]))
-        cls_id = int(cls_all[i])
-        if isinstance(names, dict):
-            label_list.append(str(names.get(cls_id, cls_id)))
-        else:
-            label_list.append(str(names[cls_id]))
-
-    indices = list(range(len(xyxy_list)))
-    if merge_iou is not None and len(indices) > 1:
-        indices = _greedy_iou_suppress_same_label(xyxy_list, conf_list, label_list, merge_iou)
-        indices = _pick_cluster_representatives_for_reading(indices, xyxy_list, conf_list, label_list, merge_iou)
+    xyxy_list, conf_list, label_list = _raw_detection_fields_from_result(r0, model_names)
+    indices = _postprocessed_detection_indices(xyxy_list, conf_list, label_list, merge_iou)
 
     scored: list[ScoredDetection] = []
     for i in indices:
@@ -868,19 +875,27 @@ def _scored_detections_from_result(
         )
 
     filtered = filter_spatial_outlier_detections([_to_detection(d) for d in scored])
-    by_xyxy = {d.xyxy: d for d in scored}
-    return [_scored_from_detection(d, by_xyxy[d.xyxy].conf) for d in filtered]
+    return _match_scored_detections(filtered, scored)
 
 
+# Сопоставить упорядоченные Detection с исходными ScoredDetection без потери confidence
 def _match_scored_detections(
     ordered: list[Detection],
     scored: list[ScoredDetection],
 ) -> list[ScoredDetection]:
-    by_xyxy = {d.xyxy: d for d in scored}
     out: list[ScoredDetection] = []
     used: set[int] = set()
     for d in ordered:
-        hit = by_xyxy.get(d.xyxy)
+        hit = next(
+            (
+                s
+                for s in scored
+                if id(s) not in used
+                and s.xyxy == d.xyxy
+                and _normalize_text(s.label) == _normalize_text(d.label)
+            ),
+            None,
+        )
         if hit is not None:
             out.append(hit)
             used.add(id(hit))
@@ -905,6 +920,7 @@ def _match_scored_detections(
     return out
 
 
+# Confidence по символам основного номера в порядке чтения
 def _char_scores_for_primary(
     primary: str,
     ordered: Iterable[ScoredDetection],
@@ -933,10 +949,12 @@ def _char_scores_for_primary(
     return [(primary[i], 0.0) for i in range(len(primary))]
 
 
+# Суммарная уверенность первых 11 символов чтения камеры
 def _camera_primary_confidence(read: CameraRead) -> float:
     return sum(conf for _ch, conf in read.char_scores[:11])
 
 
+# Ранг строки при слиянии камер: ISO-валидность важнее confidence
 def _score_fused_text(text: str, conf_sum: float) -> tuple[int, float, int]:
     normalized = _normalize_text(text)
     score = 0
@@ -946,11 +964,12 @@ def _score_fused_text(text: str, conf_sum: float) -> tuple[int, float, int]:
         score += 50
     else:
         score -= abs(11 - len(normalized))
-    if re.fullmatch(r"[A-Z]{4}[0-9]{7}", normalized):
+    if iso6346_number_format_valid(normalized):
         score += 150
     return score, conf_sum, len(normalized)
 
 
+# Перебрать спорные позиции двух камер и выбрать лучшую ISO-строку
 def _fuse_disputed_positions(
     scores1: list[tuple[str, float]],
     scores2: list[tuple[str, float]],
@@ -998,24 +1017,11 @@ def _fuse_disputed_positions(
     return best_text[:11], ok, "char_fusion" if disputed else "char_agree"
 
 
-def _clean_size_type_code(value: str | None) -> str | None:
-    raw = _normalize_text(value or "")
-    if not raw:
-        return None
-    if _is_aux_size_type_code(raw):
-        return raw
-    for size in (4, 3, 2):
-        for start in range(0, len(raw) - size + 1):
-            candidate = raw[start : start + size]
-            if _is_aux_size_type_code(candidate):
-                return candidate
-    return raw
-
-
+# Выбрать size/type code из камеры-победителя или из второй валидной камеры
 def _pick_size_type_code(cam1: CameraRead, cam2: CameraRead, winner: int | None) -> str | None:
     codes = {
-        1: _clean_size_type_code(cam1.size_type_code),
-        2: _clean_size_type_code(cam2.size_type_code),
+        1: _extract_size_type_code(cam1.size_type_code),
+        2: _extract_size_type_code(cam2.size_type_code),
     }
 
     if winner in (1, 2) and codes[winner] and _is_aux_size_type_code(codes[winner]):
@@ -1024,8 +1030,6 @@ def _pick_size_type_code(cam1: CameraRead, cam2: CameraRead, winner: int | None)
         code = codes[idx]
         if code and _is_aux_size_type_code(code):
             return code
-    if winner in (1, 2) and codes[winner]:
-        return codes[winner]
     return codes[1] or codes[2]
 
 
@@ -1075,7 +1079,7 @@ def predict_container_with_layout(
 def predict_container(
     model: "YOLO",
     image_path: Path,
-    conf: float = 0.25,
+    conf: float = 0.15,
     iou: float = 0.45,
     agnostic_nms: bool = False,
     max_det: int = 300,
@@ -1115,6 +1119,7 @@ def predict_container_read(
     return ContainerRead(text, ok, ordered, aux, layout)
 
 
+# Распознать одно изображение с сохранением confidence по символам
 def predict_camera_read(
     model: "YOLO",
     image_path: Path,
@@ -1153,6 +1158,7 @@ def predict_camera_read(
     return CameraRead(image_path, text, check_ok, scored_ordered, size_type, layout, char_scores)
 
 
+# Слить два результата чтения, отдавая приоритет ISO-валидности и confidence
 def fuse_dual_camera_reads(cam1: CameraRead, cam2: CameraRead) -> DualRead:
     t1 = _normalize_text(cam1.primary_number)
     t2 = _normalize_text(cam2.primary_number)
@@ -1170,17 +1176,37 @@ def fuse_dual_camera_reads(cam1: CameraRead, cam2: CameraRead) -> DualRead:
         )
 
     if cam1.check_ok and not cam2.check_ok:
-        return DualRead(t1, True, _pick_size_type_code(cam1, cam2, 1), cam1.layout, "cam1_valid", cam1, cam2)
+        return DualRead(
+            t1, True, _pick_size_type_code(cam1, cam2, 1), cam1.layout, "cam1_valid", cam1, cam2
+        )
 
     if cam2.check_ok and not cam1.check_ok:
-        return DualRead(t2, True, _pick_size_type_code(cam1, cam2, 2), cam2.layout, "cam2_valid", cam1, cam2)
+        return DualRead(
+            t2, True, _pick_size_type_code(cam1, cam2, 2), cam2.layout, "cam2_valid", cam1, cam2
+        )
 
     if cam1.check_ok and cam2.check_ok:
         c1 = _camera_primary_confidence(cam1)
         c2 = _camera_primary_confidence(cam2)
         if c1 >= c2:
-            return DualRead(t1, True, _pick_size_type_code(cam1, cam2, 1), cam1.layout, "cam1_confidence", cam1, cam2)
-        return DualRead(t2, True, _pick_size_type_code(cam1, cam2, 2), cam2.layout, "cam2_confidence", cam1, cam2)
+            return DualRead(
+                t1,
+                True,
+                _pick_size_type_code(cam1, cam2, 1),
+                cam1.layout,
+                "cam1_confidence",
+                cam1,
+                cam2,
+            )
+        return DualRead(
+            t2,
+            True,
+            _pick_size_type_code(cam1, cam2, 2),
+            cam2.layout,
+            "cam2_confidence",
+            cam1,
+            cam2,
+        )
 
     fused, ok, fusion = _fuse_disputed_positions(cam1.char_scores, cam2.char_scores)
     if ok:
@@ -1191,10 +1217,15 @@ def fuse_dual_camera_reads(cam1: CameraRead, cam2: CameraRead) -> DualRead:
     if _score_fused_text(t1, _camera_primary_confidence(cam1)) >= _score_fused_text(
         t2, _camera_primary_confidence(cam2)
     ):
-        return DualRead(t1, False, _pick_size_type_code(cam1, cam2, 1), cam1.layout, "cam1_fallback", cam1, cam2)
-    return DualRead(t2, False, _pick_size_type_code(cam1, cam2, 2), cam2.layout, "cam2_fallback", cam1, cam2)
+        return DualRead(
+            t1, False, _pick_size_type_code(cam1, cam2, 1), cam1.layout, "cam1_fallback", cam1, cam2
+        )
+    return DualRead(
+        t2, False, _pick_size_type_code(cam1, cam2, 2), cam2.layout, "cam2_fallback", cam1, cam2
+    )
 
 
+# Распознать пару изображений и вернуть объединённый результат
 def predict_dual_container(
     model: "YOLO",
     cam1_path: Path,
@@ -1315,6 +1346,7 @@ def _collect_images(source: Path) -> list[Path]:
     return []
 
 
+# Вернуть путь, только если source указывает ровно на одно изображение
 def _collect_single_image(source: Path) -> Path | None:
     paths = _collect_images(source)
     if len(paths) == 1:
@@ -1322,6 +1354,7 @@ def _collect_single_image(source: Path) -> Path | None:
     return None
 
 
+# Найти пару camera1/camera2 в каталоге или вернуть единственные два изображения
 def _camera_pair_in_dir(folder: Path) -> tuple[Path, Path] | None:
     images = _collect_images(folder)
     if len(images) != 2:
@@ -1334,6 +1367,7 @@ def _camera_pair_in_dir(folder: Path) -> tuple[Path, Path] | None:
     return images[0], images[1]
 
 
+# Собрать задания для двух камер: текущий каталог или его подпапки с парами изображений
 def _collect_dual_image_pairs(source: Path) -> list[tuple[Path, Path, Path]]:
     source = source.resolve()
     if not source.is_dir():
@@ -1345,7 +1379,10 @@ def _collect_dual_image_pairs(source: Path) -> list[tuple[Path, Path, Path]]:
         return [(source, cam1, cam2)]
 
     pairs: list[tuple[Path, Path, Path]] = []
-    for sub in sorted(source.iterdir(), key=lambda p: (not p.name.isdigit(), int(p.name) if p.name.isdigit() else p.name)):
+    for sub in sorted(
+        source.iterdir(),
+        key=lambda p: (not p.name.isdigit(), int(p.name) if p.name.isdigit() else p.name),
+    ):
         if not sub.is_dir():
             continue
         found = _camera_pair_in_dir(sub)
