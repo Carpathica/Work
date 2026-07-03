@@ -15,9 +15,9 @@ import argparse
 import csv
 import json
 import re
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -62,6 +62,26 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional decision filter, e.g. --include-decisions save skip.",
     )
+    parser.add_argument(
+        "--date-from",
+        default=None,
+        help="Start date filter, inclusive, in YYYY-MM-DD format.",
+    )
+    parser.add_argument(
+        "--date-to",
+        default=None,
+        help="End date filter, inclusive, in YYYY-MM-DD format.",
+    )
+    parser.add_argument(
+        "--datetime-from",
+        default=None,
+        help="Start datetime filter, inclusive, e.g. 2026-06-22T00:00:00.",
+    )
+    parser.add_argument(
+        "--datetime-to",
+        default=None,
+        help="End datetime filter, inclusive, e.g. 2026-06-24T23:59:59.",
+    )
     return parser.parse_args()
 
 
@@ -98,6 +118,105 @@ def filter_records(
         for record in records
         if str(record.get("decision") or "").strip().lower() in allowed
     ]
+
+
+def parse_timestamp(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone().replace(tzinfo=None)
+    return parsed
+
+
+def parse_datetime_arg(value: str, name: str) -> datetime:
+    parsed = parse_timestamp(value)
+    if parsed is None:
+        raise ValueError(f"{name} must be an ISO datetime, got {value!r}")
+    return parsed
+
+
+def parse_date_start(value: str, name: str) -> datetime:
+    try:
+        return datetime.fromisoformat(value).replace(hour=0, minute=0, second=0, microsecond=0)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a date in YYYY-MM-DD format, got {value!r}") from exc
+
+
+def build_time_filter(args: argparse.Namespace) -> tuple[datetime | None, datetime | None, dict[str, Any]]:
+    start: datetime | None = None
+    end: datetime | None = None
+    source = "none"
+
+    if args.datetime_from:
+        start = parse_datetime_arg(args.datetime_from, "--datetime-from")
+        source = "datetime"
+    elif args.date_from:
+        start = parse_date_start(args.date_from, "--date-from")
+        source = "date"
+
+    if args.datetime_to:
+        end = parse_datetime_arg(args.datetime_to, "--datetime-to")
+        source = "datetime"
+    elif args.date_to:
+        end = parse_date_start(args.date_to, "--date-to") + timedelta(days=1) - timedelta(microseconds=1)
+        source = "date" if source == "none" else source
+
+    if start and end and start > end:
+        raise ValueError("Datetime filter start must be earlier than or equal to end.")
+
+    return start, end, {
+        "active": bool(start or end),
+        "source": source,
+        "date_from": args.date_from,
+        "date_to": args.date_to,
+        "datetime_from": args.datetime_from,
+        "datetime_to": args.datetime_to,
+        "effective_from": start.isoformat(timespec="seconds") if start else None,
+        "effective_to": end.isoformat(timespec="seconds") if end else None,
+    }
+
+
+def filter_records_by_time(
+    records: Sequence[dict[str, Any]],
+    start: datetime | None,
+    end: datetime | None,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    if start is None and end is None:
+        return list(records), {
+            "kept": len(records),
+            "dropped_missing_or_invalid_timestamp": 0,
+            "dropped_before_start": 0,
+            "dropped_after_end": 0,
+        }
+
+    out: list[dict[str, Any]] = []
+    stats = {
+        "kept": 0,
+        "dropped_missing_or_invalid_timestamp": 0,
+        "dropped_before_start": 0,
+        "dropped_after_end": 0,
+    }
+    for record in records:
+        timestamp = parse_timestamp(record.get("timestamp"))
+        if timestamp is None:
+            stats["dropped_missing_or_invalid_timestamp"] += 1
+            continue
+        if start is not None and timestamp < start:
+            stats["dropped_before_start"] += 1
+            continue
+        if end is not None and timestamp > end:
+            stats["dropped_after_end"] += 1
+            continue
+        stats["kept"] += 1
+        out.append(record)
+    return out, stats
 
 
 def load_valid_type_codes(path: Path) -> set[str]:
@@ -190,6 +309,48 @@ def summarize_buckets(buckets: Iterable[str]) -> dict[str, Any]:
         "total": total,
         "counts": ordered,
         "rates": {key: percent(value, total) for key, value in ordered.items()},
+    }
+
+
+def summarize_camera_rows(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    bucket_summary = summarize_buckets(row["bucket"] for row in rows)
+    total = len(rows)
+    number_ok = sum(1 for row in rows if row["check_ok"])
+    type_present = sum(1 for row in rows if row["type_present"])
+    type_format_ok = sum(1 for row in rows if row["type_format_ok"])
+    type_allowlist_ok = sum(1 for row in rows if row["type_allowlist_ok"])
+    full_ok = sum(1 for row in rows if row["bucket"] == "full_number_and_type_ok")
+    attempts = sum(1 for row in rows if row["primary_number"] or row["detections_count"] > 0)
+
+    return {
+        **bucket_summary,
+        "attempts": attempts,
+        "number_ok": number_ok,
+        "number_error": bucket_summary["counts"]["number_error"],
+        "type_present": type_present,
+        "type_missing": total - type_present,
+        "type_format_ok": type_format_ok,
+        "type_format_error": total - type_format_ok,
+        "type_allowlist_ok": type_allowlist_ok,
+        "type_allowlist_error": total - type_allowlist_ok,
+        "full_number_and_type_ok": full_ok,
+        "recognition_rates": {
+            "number_ok_rate": percent(number_ok, total),
+            "type_format_ok_rate": percent(type_format_ok, total),
+            "type_allowlist_ok_rate": percent(type_allowlist_ok, total),
+            "full_number_and_type_ok_rate": percent(full_ok, total),
+        },
+    }
+
+
+def summarize_camera_rows_by_camera(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        camera_name = str(row.get("camera") or "unknown")
+        grouped[camera_name].append(row)
+    return {
+        camera_name: summarize_camera_rows(camera_rows_for_name)
+        for camera_name, camera_rows_for_name in sorted(grouped.items())
     }
 
 
@@ -306,6 +467,9 @@ def build_summary(
     pair_type_allowlist_ok = sum(1 for row in pair_level_rows if row["type_allowlist_ok"])
     camera_type_format_ok = sum(1 for row in camera_level_rows if row["type_format_ok"])
     camera_type_allowlist_ok = sum(1 for row in camera_level_rows if row["type_allowlist_ok"])
+    camera_type_present = sum(1 for row in camera_level_rows if row["type_present"])
+    camera_type_missing = len(camera_level_rows) - camera_type_present
+    type_values_total_occurrences = sum(int(row["count"]) for row in type_values)
 
     return {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
@@ -327,6 +491,14 @@ def build_summary(
             "type_allowlist_ok": camera_type_allowlist_ok,
             "type_allowlist_error": len(camera_level_rows) - camera_type_allowlist_ok,
         },
+        "camera_metrics_by_camera": summarize_camera_rows_by_camera(camera_level_rows),
+        "type_size_code_counts": {
+            "camera_rows_total": len(camera_level_rows),
+            "camera_rows_with_type": camera_type_present,
+            "camera_rows_without_type": camera_type_missing,
+            "unique_codes_seen": len(type_values),
+            "total_code_occurrences": type_values_total_occurrences,
+        },
         "type_size_codes_seen": list(type_values),
     }
 
@@ -342,13 +514,23 @@ def main() -> int:
 
     valid_codes = load_valid_type_codes(args.valid_type_codes)
     all_records = read_jsonl(args.jsonl)
-    records = filter_records(all_records, args.include_decisions)
+    decision_filtered_records = filter_records(all_records, args.include_decisions)
+    time_start, time_end, time_filter = build_time_filter(args)
+    records, time_filter_stats = filter_records_by_time(
+        decision_filtered_records,
+        time_start,
+        time_end,
+    )
     cams = camera_rows(records, valid_codes)
     pairs = pair_rows(records, valid_codes)
     type_values = type_value_rows(cams, valid_codes)
     summary = build_summary(records, pairs, cams, type_values, valid_codes)
     summary["records_input_total"] = len(all_records)
+    summary["records_after_decision_filter"] = len(decision_filtered_records)
+    summary["records_after_time_filter"] = len(records)
     summary["include_decisions"] = args.include_decisions or []
+    summary["time_filter"] = time_filter
+    summary["time_filter_stats"] = time_filter_stats
 
     write_csv(output_dir / "rows.csv", cams)
     write_csv(output_dir / "pairs.csv", pairs)
