@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -51,6 +52,36 @@ except ImportError:
     HAS_CV = False
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+TYPE_SIZE_RE = re.compile(r"^[0-9]{2}[A-Z0-9][0-9]$")
+ISO6346_VALUES = {
+    **{str(i): i for i in range(10)},
+    "A": 10,
+    "B": 12,
+    "C": 13,
+    "D": 14,
+    "E": 15,
+    "F": 16,
+    "G": 17,
+    "H": 18,
+    "I": 19,
+    "J": 20,
+    "K": 21,
+    "L": 23,
+    "M": 24,
+    "N": 25,
+    "O": 26,
+    "P": 27,
+    "Q": 28,
+    "R": 29,
+    "S": 30,
+    "T": 31,
+    "U": 32,
+    "V": 34,
+    "W": 35,
+    "X": 36,
+    "Y": 37,
+    "Z": 38,
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -59,21 +90,36 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--reader",
-        required=True,
         type=Path,
-        help="Путь к read_container.py"
+        help="Путь к read_container.py (нужен только без --collector-jsonl)"
     )
     parser.add_argument(
         "--model",
-        required=True,
         type=Path,
-        help="Путь к YOLO модели (.pt)"
+        help="Путь к YOLO модели (.pt) (нужен только без --collector-jsonl)"
     )
     parser.add_argument(
         "--source",
-        required=True,
         type=Path,
-        help="Папка с изображениями или glob-паттерн"
+        help="Папка с изображениями или glob-паттерн (нужен только без --collector-jsonl)"
+    )
+    parser.add_argument(
+        "--collector-jsonl",
+        nargs="+",
+        type=Path,
+        default=None,
+        help="JSONL логи axis_dual_container_collector.py; используются уже сохраненные детекции"
+    )
+    parser.add_argument(
+        "--valid-type-codes",
+        type=Path,
+        default=Path("configs/valid_type_size_codes.txt"),
+        help="Allowlist type_size_code, один код на строку"
+    )
+    parser.add_argument(
+        "--include-unsaved-collector-images",
+        action="store_true",
+        help="В режиме --collector-jsonl брать cam.image, если запись не была сохранена коллектором"
     )
     parser.add_argument(
         "--output-dir",
@@ -174,6 +220,169 @@ def collect_images(source: Path, recursive: bool = False) -> List[Path]:
     return []
 
 
+def normalize_text(value: Any) -> str:
+    """Normalize OCR text for container-number/type fields."""
+    return "".join(ch for ch in str(value or "").upper() if ch.isalnum())
+
+
+def split_expected(number: str, type_size_code: str = "") -> Dict[str, str]:
+    """Build dataset expected fields from an ISO 6346 number and type/size code."""
+    code = normalize_text(number)
+    return {
+        "owner_code": code[:4] if len(code) >= 4 else code,
+        "registration_number": code[4:10] if len(code) >= 10 else code[4:],
+        "check_digit": code[10:11] if len(code) >= 11 else "",
+        "type_size_code": normalize_text(type_size_code),
+    }
+
+
+def load_valid_type_codes(path: Path) -> Set[str]:
+    """Load valid type/size codes from a text allowlist."""
+    if not path.exists():
+        return set()
+    codes: Set[str] = set()
+    for line in path.read_text(encoding="utf-8-sig").splitlines():
+        code = normalize_text(line.split("#", 1)[0])
+        if code:
+            codes.add(code)
+    return codes
+
+
+def type_size_check(type_size_code: str, valid_codes: Set[str]) -> Dict[str, bool]:
+    code = normalize_text(type_size_code)
+    format_ok = bool(TYPE_SIZE_RE.fullmatch(code)) if code else False
+    allowlist_ok = code in valid_codes if code else False
+    return {
+        "present": bool(code),
+        "format_ok": format_ok,
+        "allowlist_ok": allowlist_ok,
+        "ok": allowlist_ok if valid_codes else format_ok,
+    }
+
+
+def iso6346_check_ok(number: str) -> Optional[bool]:
+    code = normalize_text(number)
+    if len(code) != 11 or not code[:4].isalpha() or not code[4:].isdigit():
+        return False
+    total = 0
+    for idx, char in enumerate(code[:10]):
+        value = ISO6346_VALUES.get(char)
+        if value is None:
+            return False
+        total += value * (2 ** idx)
+    expected_digit = (total % 11) % 10
+    return expected_digit == int(code[10])
+
+
+def read_jsonl_records(paths: List[Path]) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    for path in paths:
+        with path.open("r", encoding="utf-8-sig") as f:
+            for line_no, line in enumerate(f, start=1):
+                text = line.strip()
+                if not text:
+                    continue
+                try:
+                    row = json.loads(text)
+                except json.JSONDecodeError as exc:
+                    print(f"[warn] bad JSON in {path}:{line_no}: {exc}")
+                    continue
+                if isinstance(row, dict):
+                    row["_source_jsonl"] = str(path)
+                    row["_source_line"] = line_no
+                    records.append(row)
+    return records
+
+
+def collector_samples(
+    jsonl_paths: List[Path],
+    include_unsaved_images: bool,
+    valid_type_codes: Set[str],
+) -> List[Dict[str, Any]]:
+    """Convert collector JSONL camera rows into dataset-builder samples."""
+    samples: List[Dict[str, Any]] = []
+    records = read_jsonl_records(jsonl_paths)
+    for record in records:
+        saved_by_camera = {
+            str(item.get("camera") or ""): str(item.get("image") or "")
+            for item in record.get("saved", [])
+            if isinstance(item, dict)
+        }
+        cameras = record.get("cameras", [])
+        if not isinstance(cameras, list):
+            continue
+        for cam in cameras:
+            if not isinstance(cam, dict):
+                continue
+            camera_name = str(cam.get("camera") or "camera")
+            saved_image_text = saved_by_camera.get(camera_name) or ""
+            image_text = saved_image_text or (
+                str(cam.get("image") or "") if include_unsaved_images else ""
+            )
+            if not image_text:
+                continue
+            image_path = Path(image_text)
+            if not image_path.exists() and saved_image_text and include_unsaved_images:
+                image_text = str(cam.get("image") or "")
+                image_path = Path(image_text)
+            if not image_path.exists():
+                print(f"[warn] collector image not found, skip: {image_path}")
+                continue
+
+            number = normalize_text(cam.get("primary_number"))
+            type_size = normalize_text(cam.get("size_type_code"))
+            type_status = type_size_check(type_size, valid_type_codes)
+            expected = split_expected(number, type_size)
+            metadata = {
+                "source_image": str(image_path),
+                "collector_jsonl": record.get("_source_jsonl", ""),
+                "collector_line": record.get("_source_line", ""),
+                "collector_timestamp": record.get("timestamp", ""),
+                "collector_category": record.get("category", ""),
+                "collector_reason": record.get("reason", ""),
+                "camera": camera_name,
+                "check_ok": bool(cam.get("check_ok")),
+                "type_size_present": type_status["present"],
+                "type_size_format_ok": type_status["format_ok"],
+                "type_size_allowlist_ok": type_status["allowlist_ok"],
+                "type_size_ok": type_status["ok"],
+                "raw_detections_count": int(cam.get("detections_count") or 0),
+                "detections_count": int(cam.get("detections_count") or 0),
+                "duplicates_removed": 0,
+                "layout": cam.get("layout", ""),
+            }
+            result = {
+                "result": format_container_result_like_reader(expected),
+                "elapsed_ms": 0.0,
+                "raw_detections_count": metadata["raw_detections_count"],
+                "detections_count": metadata["detections_count"],
+                "duplicates_removed": 0,
+                "check_ok": metadata["check_ok"],
+                "type_size_ok": metadata["type_size_ok"],
+                "type_size_format_ok": metadata["type_size_format_ok"],
+                "type_size_allowlist_ok": metadata["type_size_allowlist_ok"],
+            }
+            samples.append(
+                {
+                    "image_path": image_path.resolve(),
+                    "case_stem": f"{image_path.stem}_{camera_name}",
+                    "expected": expected,
+                    "result": result,
+                    "metadata": metadata,
+                }
+            )
+    return samples
+
+
+def format_container_result_like_reader(expected: Dict[str, str]) -> List[Dict[str, str]]:
+    return [
+        {"label": "owner_code", "text": expected.get("owner_code", "")},
+        {"label": "registration_number", "text": expected.get("registration_number", "")},
+        {"label": "check_digit", "text": expected.get("check_digit", "")},
+        {"label": "type_size_code", "text": expected.get("type_size_code", "")},
+    ]
+
+
 def run_reader(
     reader_path: Path,
     model_path: Path,
@@ -266,6 +475,33 @@ def build_full_code(expected: Dict[str, str]) -> str:
     if type_size:
         return f"{iso} {type_size}".strip()
     return iso.strip()
+
+
+def edit_expected_in_console(expected: Dict[str, str], valid_type_codes: Set[str]) -> Dict[str, str]:
+    """Let the user correct number/type in the terminal while the preview is paused."""
+    current_number = build_iso_code(expected)
+    current_type = expected.get("type_size_code", "")
+    print("\n[edit] Press Enter to keep the current value, '-' to clear it.")
+    number = input(f"[edit] container number [{current_number}]: ").strip()
+    if number == "":
+        number = current_number
+    elif number == "-":
+        number = ""
+    type_size = input(f"[edit] type_size [{current_type}]: ").strip()
+    if type_size == "":
+        type_size = current_type
+    elif type_size == "-":
+        type_size = ""
+
+    corrected = split_expected(number, type_size)
+    status = type_size_check(corrected.get("type_size_code", ""), valid_type_codes)
+    print(
+        "[edit] corrected: "
+        f"ISO={build_iso_code(corrected) or '(empty)'}, "
+        f"type_size={corrected.get('type_size_code', '') or '(empty)'}, "
+        f"type_ok={status['ok']}"
+    )
+    return corrected
 
 
 def save_case(
@@ -380,14 +616,20 @@ def create_annotated_image(
     iso_code = build_iso_code(expected)
     full_code = build_full_code(expected)
     type_size = expected.get("type_size_code", "")
+    check_ok = result.get("check_ok")
+    type_size_ok = result.get("type_size_ok")
+    check_text = "-" if check_ok is None else str(bool(check_ok))
+    type_check_text = "-" if type_size_ok is None else str(bool(type_size_ok))
     
     lines = [
         f"ISO: {iso_code}",
         f"Full: {full_code}",
         f"Type/Size: {type_size}",
+        f"check_ok: {check_text} | type_size_ok: {type_check_text}",
         f"Time: {elapsed_ms:.1f}ms",
         "",
-        "Y/Enter/Space = сохранить (правильно)",
+        "Y/Enter/Space = сохранить",
+        "E = исправить номер/type_size и сохранить",
         "N = пропустить (неправильно)",
         "Q/Esc = выход"
     ]
@@ -418,10 +660,10 @@ def create_annotated_image(
     return frame
 
 
-def show_preview(image_path: Path, result: Dict[str, Any], expected: Dict[str, str]) -> Optional[bool]:
+def show_preview(image_path: Path, result: Dict[str, Any], expected: Dict[str, str]) -> Optional[str]:
     """
     Показать предпросмотр с результатом распознавания.
-    Возвращает True если сохранить, False если пропустить, None если выйти.
+    Возвращает "save", "skip", "edit" или None если выйти.
     """
     if not HAS_CV:
         print("[warn] OpenCV не установлен. Используйте --no-interactive для автоматического режима.")
@@ -442,37 +684,57 @@ def show_preview(image_path: Path, result: Dict[str, Any], expected: Dict[str, s
     
     if key in (ord("q"), ord("Q"), 27):  # Q, q, Esc
         return None
-    elif key in (ord("y"), ord("Y"), ord("n"), ord("N")):
-        return key in (ord("y"), ord("Y"))
+    elif key in (ord("y"), ord("Y")):
+        return "save"
+    elif key in (ord("n"), ord("N")):
+        return "skip"
+    elif key in (ord("e"), ord("E")):
+        return "edit"
     elif key in (13, 32):  # Enter, Space
-        return True
+        return "save"
     else:
         return None
 
 
 def main() -> int:
     args = parse_args()
+    collector_mode = bool(args.collector_jsonl)
     
     # Проверка зависимостей
     if not args.no_interactive and not HAS_CV:
         print("[error] OpenCV не установлен. Установите opencv-python или используйте --no-interactive")
         return 1
     
+    valid_type_codes = load_valid_type_codes(args.valid_type_codes)
+
     # Проверка путей
-    reader_path = args.reader.resolve()
-    if not reader_path.exists():
-        print(f"[error] read_container.py не найден: {reader_path}")
-        return 1
-    
-    model_path = args.model.resolve()
-    if not model_path.exists():
-        print(f"[error] модель не найдена: {model_path}")
-        return 1
-    
-    source_path = args.source.resolve()
-    if not source_path.exists():
-        print(f"[error] источник не найден: {source_path}")
-        return 1
+    reader_path: Optional[Path] = None
+    model_path: Optional[Path] = None
+    source_path: Optional[Path] = None
+    if collector_mode:
+        for jsonl_path in args.collector_jsonl:
+            if not jsonl_path.exists():
+                print(f"[error] collector JSONL не найден: {jsonl_path}")
+                return 1
+    else:
+        if args.reader is None or args.model is None or args.source is None:
+            print("[error] без --collector-jsonl нужны --reader, --model и --source")
+            return 1
+
+        reader_path = args.reader.resolve()
+        if not reader_path.exists():
+            print(f"[error] read_container.py не найден: {reader_path}")
+            return 1
+
+        model_path = args.model.resolve()
+        if not model_path.exists():
+            print(f"[error] модель не найдена: {model_path}")
+            return 1
+
+        source_path = args.source.resolve()
+        if not source_path.exists():
+            print(f"[error] источник не найден: {source_path}")
+            return 1
     
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -480,17 +742,44 @@ def main() -> int:
     output_images_dir = output_dir / "images"
     dataset_path = output_dir / args.dataset_file
     
-    # Сбор изображений
-    image_paths = collect_images(source_path, recursive=args.recursive)
-    if not image_paths:
-        print(f"[error] изображения не найдены: {source_path}")
-        return 1
-    
-    if args.max_images is not None:
-        image_paths = image_paths[: args.max_images]
-    
-    print(f"[info] найдено {len(image_paths)} изображений")
-    print(f"[info] модель: {model_path}")
+    # Сбор входных samples
+    if collector_mode:
+        samples = collector_samples(
+            [path.resolve() for path in args.collector_jsonl],
+            include_unsaved_images=args.include_unsaved_collector_images,
+            valid_type_codes=valid_type_codes,
+        )
+        if args.max_images is not None:
+            samples = samples[: args.max_images]
+        if not samples:
+            print("[error] в collector JSONL не найдено сохраненных изображений")
+            return 1
+    else:
+        assert source_path is not None
+        image_paths = collect_images(source_path, recursive=args.recursive)
+        if not image_paths:
+            print(f"[error] изображения не найдены: {source_path}")
+            return 1
+
+        if args.max_images is not None:
+            image_paths = image_paths[: args.max_images]
+        samples = [
+            {
+                "image_path": image_path,
+                "case_stem": image_path.stem,
+                "expected": None,
+                "result": None,
+                "metadata": {},
+            }
+            for image_path in image_paths
+        ]
+
+    print(f"[info] найдено {len(samples)} изображений")
+    if model_path is not None:
+        print(f"[info] модель: {model_path}")
+    if collector_mode:
+        print(f"[info] collector JSONL: {', '.join(str(p.resolve()) for p in args.collector_jsonl)}")
+        print(f"[info] valid type_size codes: {len(valid_type_codes)}")
     print(f"[info] вывод: {output_dir}")
     print(f"[info] режим: {'интерактивный' if not args.no_interactive else 'автоматический'}")
     
@@ -506,23 +795,30 @@ def main() -> int:
     errors = 0
     latencies_ms: List[float] = []
     
-    for idx, image_path in enumerate(image_paths, start=1):
-        print(f"\n[{idx}/{len(image_paths)}] обработка {image_path.name}...")
+    for idx, sample in enumerate(samples, start=1):
+        image_path = Path(sample["image_path"])
+        print(f"\n[{idx}/{len(samples)}] обработка {image_path.name}...")
         
         started = time.perf_counter()
         
-        # Запуск read_container.py
-        result = run_reader(
-            reader_path=reader_path,
-            model_path=model_path,
-            image_path=image_path,
-            conf=args.conf,
-            iou=args.iou,
-            max_det=args.max_det,
-            merge_iou=args.merge_iou
-        )
-        
-        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        if collector_mode:
+            result = sample["result"]
+            elapsed_ms = float(result.get("elapsed_ms", 0.0) or 0.0)
+        else:
+            assert reader_path is not None
+            assert model_path is not None
+            # Запуск read_container.py
+            result = run_reader(
+                reader_path=reader_path,
+                model_path=model_path,
+                image_path=image_path,
+                conf=args.conf,
+                iou=args.iou,
+                max_det=args.max_det,
+                merge_iou=args.merge_iou
+            )
+
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
         latencies_ms.append(elapsed_ms)
         
         if result is None:
@@ -533,13 +829,14 @@ def main() -> int:
         processed += 1
         
         # Парсинг результата
-        expected = parse_reader_result(result)
+        expected = dict(sample["expected"]) if collector_mode else parse_reader_result(result)
         iso = build_iso_code(expected)
         
         print(f"[result] ISO: {iso or '(пусто)'}, Type/Size: {expected.get('type_size_code', '')}")
         
         # Определение действия
         should_save = False
+        manual_corrected = False
         
         if args.no_interactive:
             # Автоматический режим - сохранять всё
@@ -552,7 +849,13 @@ def main() -> int:
             if decision is None:
                 print("[quit] выход по запросу пользователя")
                 break
-            elif decision:
+            elif decision == "edit":
+                expected = edit_expected_in_console(expected, valid_type_codes)
+                result["result"] = format_container_result_like_reader(expected)
+                manual_corrected = True
+                should_save = True
+                print("[save] исправлено пользователем (E)")
+            elif decision == "save":
                 should_save = True
                 print("[save] подтверждено пользователем (Y)")
             else:
@@ -564,13 +867,30 @@ def main() -> int:
             continue
         
         # Генерация уникального ID
-        case_id = ensure_unique_case_id(image_path.stem, existing_ids)
+        case_id = ensure_unique_case_id(str(sample.get("case_stem") or image_path.stem), existing_ids)
         existing_ids.add(case_id)
         
         # Получение количества детекций (если есть в выводе)
         raw_count = result.get("raw_detections_count", 0)
         det_count = result.get("detections_count", 0)
         duplicates_removed = result.get("duplicates_removed", 0)
+        final_type_status = type_size_check(expected.get("type_size_code", ""), valid_type_codes)
+        final_number_check_ok = iso6346_check_ok(build_iso_code(expected))
+        final_metadata = {
+            **dict(sample.get("metadata") or {}),
+            "source_image": str(image_path),
+            "model": str(model_path) if model_path is not None else "",
+            "latency_ms": round(elapsed_ms, 3),
+            "raw_detections_count": raw_count,
+            "detections_count": det_count,
+            "duplicates_removed": duplicates_removed,
+            "manual_corrected": manual_corrected,
+            "final_check_ok": final_number_check_ok,
+            "final_type_size_present": final_type_status["present"],
+            "final_type_size_format_ok": final_type_status["format_ok"],
+            "final_type_size_allowlist_ok": final_type_status["allowlist_ok"],
+            "final_type_size_ok": final_type_status["ok"],
+        }
         
         # Сохранение кейса
         save_case(
@@ -581,14 +901,7 @@ def main() -> int:
             scenario_name=args.scenario_name,
             scenario_version=args.scenario_version,
             expected=expected,
-            metadata={
-                "source_image": str(image_path),
-                "model": str(model_path),
-                "latency_ms": round(elapsed_ms, 3),
-                "raw_detections_count": raw_count,
-                "detections_count": det_count,
-                "duplicates_removed": duplicates_removed,
-            },
+            metadata=final_metadata,
             copy_images=args.copy_images
         )
         
@@ -599,12 +912,13 @@ def main() -> int:
     avg_latency = sum(latencies_ms) / len(latencies_ms) if latencies_ms else 0
     
     summary = {
-        "reader": str(reader_path),
-        "model": str(model_path),
-        "source": str(source_path),
+        "reader": str(reader_path) if reader_path is not None else "",
+        "model": str(model_path) if model_path is not None else "",
+        "source": str(source_path) if source_path is not None else "",
+        "collector_jsonl": [str(path.resolve()) for path in args.collector_jsonl] if collector_mode else [],
         "output_dir": str(output_dir),
         "dataset_file": str(dataset_path),
-        "images_total": len(image_paths),
+        "images_total": len(samples),
         "processed": processed,
         "saved": saved,
         "skipped": skipped,
@@ -626,7 +940,7 @@ def main() -> int:
     print("[done] Генерация датасета завершена")
     print(f"[done] датасет: {dataset_path}")
     print(f"[done] summary: {summary_path}")
-    print(f"[stats] всего изображений: {len(image_paths)}")
+    print(f"[stats] всего изображений: {len(samples)}")
     print(f"[stats] обработано: {processed}")
     print(f"[stats] сохранено: {saved}")
     print(f"[stats] пропущено: {skipped}")
