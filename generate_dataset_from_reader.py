@@ -116,6 +116,11 @@ def parse_args() -> argparse.Namespace:
         help="JSONL логи axis_dual_container_collector.py; используются уже сохраненные детекции"
     )
     parser.add_argument(
+        "--collector-pairs",
+        action="store_true",
+        help="В режиме --collector-jsonl создавать один evaluate_accuracy case на пару cam1+cam2"
+    )
+    parser.add_argument(
         "--valid-type-codes",
         type=Path,
         default=Path("configs/valid_type_size_codes.txt"),
@@ -386,6 +391,384 @@ def format_container_result_like_reader(expected: Dict[str, str]) -> List[Dict[s
         {"label": "check_digit", "text": expected.get("check_digit", "")},
         {"label": "type_size_code", "text": expected.get("type_size_code", "")},
     ]
+
+
+def load_existing_iso_codes(dataset_path: Path) -> Set[str]:
+    codes: Set[str] = set()
+    if not dataset_path.exists():
+        return codes
+    for line in dataset_path.read_text(encoding="utf-8-sig").splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        expected = row.get("expected")
+        if isinstance(expected, dict):
+            code = normalize_text(
+                f"{expected.get('owner_code', '')}"
+                f"{expected.get('registration_number', '')}"
+                f"{expected.get('check_digit', '')}"
+            )
+            if code:
+                codes.add(code)
+    return codes
+
+
+def collector_image_for_camera(
+    record: Dict[str, Any],
+    cam: Dict[str, Any],
+    include_unsaved_images: bool,
+) -> Optional[Path]:
+    camera_name = str(cam.get("camera") or "")
+    saved_items = record.get("saved") if isinstance(record.get("saved"), list) else []
+    saved_by_camera = {
+        str(item.get("camera") or ""): str(item.get("image") or "")
+        for item in saved_items
+        if isinstance(item, dict)
+    }
+    candidates: List[str] = []
+    if saved_by_camera.get(camera_name):
+        candidates.append(saved_by_camera[camera_name])
+    if include_unsaved_images and cam.get("image"):
+        candidates.append(str(cam.get("image")))
+    for value in candidates:
+        path = Path(value)
+        if path.exists():
+            return path.resolve()
+    return None
+
+
+def choose_pair_number(record: Dict[str, Any], cameras: List[Dict[str, Any]]) -> str:
+    record_number = normalize_text(record.get("number"))
+    if record_number:
+        return record_number
+    check_ok_numbers = [
+        normalize_text(cam.get("primary_number"))
+        for cam in cameras
+        if bool(cam.get("check_ok")) and normalize_text(cam.get("primary_number"))
+    ]
+    unique = sorted(set(check_ok_numbers))
+    if len(unique) == 1:
+        return unique[0]
+    return ""
+
+
+def choose_pair_type_size(
+    cameras: List[Dict[str, Any]],
+    valid_type_codes: Set[str],
+) -> tuple[str, str]:
+    candidates: List[tuple[int, str, str]] = []
+    for cam in cameras:
+        code = normalize_text(cam.get("size_type_code"))
+        if not code:
+            continue
+        status = type_size_check(code, valid_type_codes)
+        score = 0
+        if status["allowlist_ok"]:
+            score += 100
+        if status["format_ok"]:
+            score += 10
+        if bool(cam.get("check_ok")):
+            score += 1
+        candidates.append((score, code, str(cam.get("camera") or "")))
+    if not candidates:
+        return "", ""
+    candidates.sort(reverse=True)
+    _score, code, camera_name = candidates[0]
+    return code, camera_name
+
+
+def collector_pair_samples(
+    jsonl_paths: List[Path],
+    include_unsaved_images: bool,
+    valid_type_codes: Set[str],
+) -> List[Dict[str, Any]]:
+    samples: List[Dict[str, Any]] = []
+    records = read_jsonl_records(jsonl_paths)
+    for record in records:
+        cameras = [cam for cam in record.get("cameras", []) if isinstance(cam, dict)]
+        if len(cameras) < 2:
+            continue
+        pair_cameras: List[Dict[str, Any]] = []
+        image_paths: List[Path] = []
+        for cam in cameras[:2]:
+            image_path = collector_image_for_camera(record, cam, include_unsaved_images)
+            if image_path is None:
+                break
+            pair_cameras.append(cam)
+            image_paths.append(image_path)
+        if len(image_paths) != 2:
+            continue
+
+        pair_number = choose_pair_number(record, pair_cameras)
+        pair_type, type_source = choose_pair_type_size(pair_cameras, valid_type_codes)
+        expected = split_expected(pair_number, pair_type)
+        samples.append(
+            {
+                "case_stem": (
+                    f"pair_{record.get('_source_line', len(samples) + 1)}_"
+                    f"{image_paths[0].stem}_{image_paths[1].stem}"
+                ),
+                "image_paths": image_paths,
+                "expected": expected,
+                "record": record,
+                "cameras": pair_cameras,
+                "type_source_camera": type_source,
+            }
+        )
+    return samples
+
+
+def make_pair_preview(sample: Dict[str, Any], expected: Dict[str, str]) -> Optional[Any]:
+    if not HAS_CV:
+        return None
+    frames = []
+    for path in sample["image_paths"]:
+        frame = cv2.imread(str(path))
+        if frame is None:
+            return None
+        frames.append(frame)
+    target_h = min(720, max(frame.shape[0] for frame in frames))
+    resized = []
+    for frame in frames:
+        h, w = frame.shape[:2]
+        scale = target_h / max(h, 1)
+        resized.append(cv2.resize(frame, (max(1, int(w * scale)), target_h)))
+    canvas = cv2.hconcat(resized)
+
+    iso_code = build_iso_code(expected)
+    type_size = expected.get("type_size_code", "")
+    type_status = type_size_check(type_size, set())
+    record = sample["record"]
+    cameras = sample["cameras"]
+    lines = [
+        f"PAIR ISO: {iso_code or '-'}  type_size: {type_size or '-'}",
+        f"pair_check_ok: {iso6346_check_ok(iso_code)}  type_format_ok: {type_status['format_ok']}",
+        f"decision: {record.get('decision', '-')}  reason: {record.get('reason', '-')}",
+    ]
+    for cam in cameras:
+        lines.append(
+            f"{cam.get('camera', '-')}: num={normalize_text(cam.get('primary_number')) or '-'} "
+            f"check_ok={bool(cam.get('check_ok'))} "
+            f"type={normalize_text(cam.get('size_type_code')) or '-'} "
+            f"dets={cam.get('detections_count', 0)}"
+        )
+    lines.extend(
+        [
+            "Y/Enter/Space accept | E edit | N reject",
+            "Left/A previous | Right/D next | Q/Esc quit",
+        ]
+    )
+
+    font_scale = min(0.9, max(0.5, canvas.shape[1] / 1500))
+    thickness = max(1, int(2 * font_scale))
+    for i, line in enumerate(lines):
+        color = (100, 255, 100) if i == 0 else (220, 240, 255)
+        origin = (15, 25 + i * 28)
+        cv2.putText(canvas, line, origin, cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness + 2, cv2.LINE_AA)
+        cv2.putText(canvas, line, origin, cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, thickness, cv2.LINE_AA)
+    return canvas
+
+
+def show_pair_preview(sample: Dict[str, Any], expected: Dict[str, str]) -> Optional[str]:
+    frame = make_pair_preview(sample, expected)
+    if frame is None:
+        return None
+    cv2.namedWindow(PREVIEW_WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.imshow(PREVIEW_WINDOW_NAME, frame)
+    key = cv2.waitKeyEx(0)
+    key_char = key & 0xFF
+    if key_char in (ord("q"), ord("Q"), 27):
+        return "quit"
+    if key_char in (ord("y"), ord("Y"), 13, 32):
+        return "save"
+    if key_char in (ord("n"), ord("N")):
+        return "skip"
+    if key_char in (ord("e"), ord("E")):
+        return "edit"
+    if key_char in (ord("a"), ord("A"), ord("b"), ord("B"), ord("p"), ord("P")) or key in (KEY_LEFT, KEY_PAGE_UP):
+        return "prev"
+    if key_char in (ord("d"), ord("D")) or key in (KEY_RIGHT, KEY_PAGE_DOWN):
+        return "next"
+    return "refresh"
+
+
+def save_pair_case(
+    *,
+    image_paths: List[Path],
+    output_images_dir: Path,
+    dataset_path: Path,
+    case_id: str,
+    scenario_name: str,
+    scenario_version: int,
+    expected: Dict[str, str],
+    metadata: Dict[str, Any],
+    copy_images: bool,
+) -> None:
+    output_images_dir.mkdir(parents=True, exist_ok=True)
+    image_refs: List[str] = []
+    for idx, image_path in enumerate(image_paths, start=1):
+        if copy_images:
+            suffix = image_path.suffix.lower() or ".jpg"
+            out_name = f"{case_id}_cam{idx}{suffix}"
+            out_path = output_images_dir / out_name
+            shutil.copy2(image_path, out_path)
+            image_refs.append(f"images/{out_name}")
+        else:
+            image_refs.append(str(image_path.resolve()))
+    iso_code = build_iso_code(expected)
+    row = {
+        "id": case_id,
+        "images": image_refs,
+        "scenario": scenario_name,
+        "expected": expected,
+        "metadata": {
+            "scenario_version": scenario_version,
+            "iso_code": iso_code,
+            "full_code": build_full_code(expected),
+            **metadata,
+        },
+    }
+    with dataset_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def run_collector_pair_builder(
+    args: argparse.Namespace,
+    *,
+    output_images_dir: Path,
+    dataset_path: Path,
+    valid_type_codes: Set[str],
+) -> Dict[str, Any]:
+    samples = collector_pair_samples(
+        [path.resolve() for path in args.collector_jsonl],
+        include_unsaved_images=args.include_unsaved_collector_images,
+        valid_type_codes=valid_type_codes,
+    )
+    if args.max_images is not None:
+        samples = samples[: args.max_images]
+    if not samples:
+        raise RuntimeError("No complete cam1+cam2 pairs found in collector JSONL.")
+
+    existing_ids = load_existing_case_ids(dataset_path)
+    accepted_numbers = load_existing_iso_codes(dataset_path)
+    processed = saved = skipped = duplicates = errors = 0
+    idx = 0
+    while idx < len(samples):
+        sample = samples[idx]
+        expected = dict(sample["expected"])
+        print(
+            f"\n[{idx + 1}/{len(samples)}] pair "
+            f"{sample['image_paths'][0].name} + {sample['image_paths'][1].name}"
+        )
+        print(
+            f"[pair] ISO={build_iso_code(expected) or '-'} "
+            f"type={expected.get('type_size_code') or '-'}"
+        )
+
+        if args.no_interactive:
+            decision = "save"
+        else:
+            decision = show_pair_preview(sample, expected)
+
+        if decision == "quit":
+            break
+        if decision == "prev":
+            idx = max(0, idx - 1)
+            continue
+        if decision == "next":
+            idx = min(len(samples) - 1, idx + 1)
+            continue
+        if decision == "refresh":
+            continue
+        if decision == "edit":
+            expected = edit_expected_in_console(expected, valid_type_codes)
+            sample["expected"] = expected
+            decision = "save"
+        if decision == "skip":
+            skipped += 1
+            idx += 1
+            continue
+        if decision != "save":
+            idx += 1
+            continue
+
+        processed += 1
+        final_number = build_iso_code(expected)
+        if not final_number:
+            print("[skip] empty final ISO number")
+            skipped += 1
+            idx += 1
+            continue
+        if final_number in accepted_numbers:
+            print(f"[duplicate] {final_number} already exists; pair skipped")
+            duplicates += 1
+            idx += 1
+            continue
+
+        case_id = ensure_unique_case_id(str(sample.get("case_stem") or final_number), existing_ids)
+        existing_ids.add(case_id)
+        type_status = type_size_check(expected.get("type_size_code", ""), valid_type_codes)
+        metadata = {
+            "collector_jsonl": sample["record"].get("_source_jsonl", ""),
+            "collector_line": sample["record"].get("_source_line", ""),
+            "collector_timestamp": sample["record"].get("timestamp", ""),
+            "collector_decision": sample["record"].get("decision", ""),
+            "collector_reason": sample["record"].get("reason", ""),
+            "camera_numbers": {
+                str(cam.get("camera") or f"cam{i + 1}"): normalize_text(cam.get("primary_number"))
+                for i, cam in enumerate(sample["cameras"])
+            },
+            "camera_check_ok": {
+                str(cam.get("camera") or f"cam{i + 1}"): bool(cam.get("check_ok"))
+                for i, cam in enumerate(sample["cameras"])
+            },
+            "camera_type_size_codes": {
+                str(cam.get("camera") or f"cam{i + 1}"): normalize_text(cam.get("size_type_code"))
+                for i, cam in enumerate(sample["cameras"])
+            },
+            "type_size_source_camera": sample.get("type_source_camera", ""),
+            "final_check_ok": iso6346_check_ok(final_number),
+            "final_type_size_present": type_status["present"],
+            "final_type_size_format_ok": type_status["format_ok"],
+            "final_type_size_allowlist_ok": type_status["allowlist_ok"],
+            "final_type_size_ok": type_status["ok"],
+        }
+        try:
+            save_pair_case(
+                image_paths=sample["image_paths"],
+                output_images_dir=output_images_dir,
+                dataset_path=dataset_path,
+                case_id=case_id,
+                scenario_name=args.scenario_name,
+                scenario_version=args.scenario_version,
+                expected=expected,
+                metadata=metadata,
+                copy_images=args.copy_images,
+            )
+        except Exception as exc:
+            errors += 1
+            print(f"[error] failed to save pair: {exc}")
+            idx += 1
+            continue
+        accepted_numbers.add(final_number)
+        saved += 1
+        print(f"[save] {case_id} | ISO={final_number} type={expected.get('type_size_code', '')}")
+        idx += 1
+
+    if not args.no_interactive and HAS_CV:
+        cv2.destroyAllWindows()
+    return {
+        "mode": "collector_pairs",
+        "pairs_total": len(samples),
+        "processed": processed,
+        "saved": saved,
+        "skipped": skipped,
+        "duplicates": duplicates,
+        "errors": errors,
+    }
 
 
 def run_reader(
@@ -755,6 +1138,48 @@ def main() -> int:
     
     output_images_dir = output_dir / "images"
     dataset_path = output_dir / args.dataset_file
+
+    if collector_mode and args.collector_pairs:
+        try:
+            pair_summary = run_collector_pair_builder(
+                args,
+                output_images_dir=output_images_dir,
+                dataset_path=dataset_path,
+                valid_type_codes=valid_type_codes,
+            )
+        except Exception as exc:
+            print(f"[error] {exc}")
+            return 1
+        summary = {
+            "reader": "",
+            "model": "",
+            "source": "",
+            "collector_jsonl": [str(path.resolve()) for path in args.collector_jsonl],
+            "output_dir": str(output_dir),
+            "dataset_file": str(dataset_path),
+            "copy_images": args.copy_images,
+            "scenario": args.scenario_name,
+            "scenario_version": args.scenario_version,
+            "interactive": not args.no_interactive,
+            **pair_summary,
+        }
+        summary_path = output_dir / "dataset_build_summary.json"
+        summary_path.write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        print("\n" + "=" * 50)
+        print("[done] Pair dataset generation complete")
+        print(f"[done] dataset: {dataset_path}")
+        print(f"[done] summary: {summary_path}")
+        print(
+            f"[stats] pairs={pair_summary['pairs_total']} "
+            f"saved={pair_summary['saved']} "
+            f"skipped={pair_summary['skipped']} "
+            f"duplicates={pair_summary['duplicates']} "
+            f"errors={pair_summary['errors']}"
+        )
+        return 0
     
     # Сбор входных samples
     if collector_mode:
