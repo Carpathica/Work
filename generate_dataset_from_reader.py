@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 Интерактивный скрипт для генерации датасета в формате YOK1_dataset путём запуска read_container.py.
 
@@ -53,6 +53,11 @@ except ImportError:
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 TYPE_SIZE_RE = re.compile(r"^[0-9]{2}[A-Z0-9][0-9]$")
+PREVIEW_WINDOW_NAME = "Dataset Builder"
+KEY_LEFT = 2424832
+KEY_RIGHT = 2555904
+KEY_PAGE_UP = 2162688
+KEY_PAGE_DOWN = 2228224
 ISO6346_VALUES = {
     **{str(i): i for i in range(10)},
     "A": 10,
@@ -597,7 +602,7 @@ def create_annotated_image(
         return None
     
     # Получение размеров для масштабирования текста
-    height, width = frame.shape[:2]
+    _height, width = frame.shape[:2]
     font_scale = min(1.0, max(0.5, width / 800))
     thickness = max(1, int(2 * font_scale))
     
@@ -635,21 +640,27 @@ def create_annotated_image(
     ]
     
     # Рисование фона для текста
-    text_height = 30 * len(lines)
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (0, 0), (width, text_height), (0, 0, 0), -1)
-    cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
-    
     # Рисование текста
     y_offset = 25
     for i, line in enumerate(lines):
         color = (100, 255, 100) if i == 0 else (200, 255, 200) if i < 3 else (180, 180, 255)
         if i >= 4:  # Инструкции
             color = (200, 200, 255)
+        origin = (15, y_offset + i * 30)
         cv2.putText(
             frame,
             line,
-            (15, y_offset + i * 30),
+            origin,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale * 0.7,
+            (0, 0, 0),
+            thickness + 2,
+            cv2.LINE_AA
+        )
+        cv2.putText(
+            frame,
+            line,
+            origin,
             cv2.FONT_HERSHEY_SIMPLEX,
             font_scale * 0.7,
             color,
@@ -674,26 +685,29 @@ def show_preview(image_path: Path, result: Dict[str, Any], expected: Dict[str, s
         return None
     
     window_name = "Dataset Builder - Y/N для подтверждения"
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-    cv2.imshow(window_name, frame)
+    cv2.namedWindow(PREVIEW_WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.imshow(PREVIEW_WINDOW_NAME, frame)
     
     # Ожидание нажатия клавиши
-    key = cv2.waitKey(0) & 0xFF
+    key = cv2.waitKeyEx(0)
+    key_char = key & 0xFF
     
-    cv2.destroyAllWindows()
-    
-    if key in (ord("q"), ord("Q"), 27):  # Q, q, Esc
-        return None
-    elif key in (ord("y"), ord("Y")):
+    if key_char in (ord("q"), ord("Q"), 27):  # Q, q, Esc
+        return "quit"
+    elif key_char in (ord("y"), ord("Y")):
         return "save"
-    elif key in (ord("n"), ord("N")):
+    elif key_char in (ord("n"), ord("N")):
         return "skip"
-    elif key in (ord("e"), ord("E")):
+    elif key_char in (ord("e"), ord("E")):
         return "edit"
-    elif key in (13, 32):  # Enter, Space
+    elif key_char in (ord("a"), ord("A"), ord("b"), ord("B"), ord("p"), ord("P")) or key in (KEY_LEFT, KEY_PAGE_UP):
+        return "prev"
+    elif key_char in (ord("d"), ord("D")) or key in (KEY_RIGHT, KEY_PAGE_DOWN):
+        return "next"
+    elif key_char in (13, 32):  # Enter, Space
         return "save"
     else:
-        return None
+        return "refresh"
 
 
 def main() -> int:
@@ -794,10 +808,14 @@ def main() -> int:
     skipped = 0
     errors = 0
     latencies_ms: List[float] = []
+    saved_indices: Set[int] = set()
     
-    for idx, sample in enumerate(samples, start=1):
+    idx = 0
+    while idx < len(samples):
+        sample = samples[idx]
+        display_idx = idx + 1
         image_path = Path(sample["image_path"])
-        print(f"\n[{idx}/{len(samples)}] обработка {image_path.name}...")
+        print(f"\n[{display_idx}/{len(samples)}] обработка {image_path.name}...")
         
         started = time.perf_counter()
         
@@ -823,6 +841,7 @@ def main() -> int:
         
         if result is None:
             errors += 1
+            idx += 1
             print(f"[warn] нет результата для {image_path.name}")
             continue
         
@@ -846,12 +865,22 @@ def main() -> int:
             # Интерактивный режим
             decision = show_preview(image_path, result, expected)
             
-            if decision is None:
+            if decision == "quit":
                 print("[quit] выход по запросу пользователя")
                 break
+            elif decision == "prev":
+                idx = max(0, idx - 1)
+                continue
+            elif decision == "next":
+                idx = min(len(samples) - 1, idx + 1)
+                continue
+            elif decision == "refresh":
+                continue
             elif decision == "edit":
                 expected = edit_expected_in_console(expected, valid_type_codes)
                 result["result"] = format_container_result_like_reader(expected)
+                sample["expected"] = expected
+                sample["result"] = result
                 manual_corrected = True
                 should_save = True
                 print("[save] исправлено пользователем (E)")
@@ -860,10 +889,17 @@ def main() -> int:
                 print("[save] подтверждено пользователем (Y)")
             else:
                 skipped += 1
+                idx += 1
                 print("[skip] отклонено пользователем (N)")
                 continue
         
         if not should_save:
+            idx += 1
+            continue
+
+        if idx in saved_indices:
+            print("[skip] already saved in this session")
+            idx += 1
             continue
         
         # Генерация уникального ID
@@ -906,9 +942,14 @@ def main() -> int:
         )
         
         saved += 1
+        saved_indices.add(idx)
+        idx += 1
         print(f"[save] {case_id} | ISO: {iso or '(пусто)'}")
     
     # Статистика
+    if not args.no_interactive and HAS_CV:
+        cv2.destroyAllWindows()
+
     avg_latency = sum(latencies_ms) / len(latencies_ms) if latencies_ms else 0
     
     summary = {
@@ -952,3 +993,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
