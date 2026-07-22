@@ -39,6 +39,9 @@ DEFAULT_WEIGHTS = "runs/detect/model_8_05_26_278e_26m/best.pt"
 DEFAULT_OUTPUT_ROOT = "datasets/axis_collected"
 DEFAULT_STATE_FILE = "runs/axis_dual_collector_state.json"
 DEFAULT_LOG_JSONL = "runs/axis_dual_collector.jsonl"
+COLLECTOR_MODE_DUAL = "dual_camera"
+COLLECTOR_MODE_SINGLE = "single_camera"
+COLLECTOR_MODES = {COLLECTOR_MODE_DUAL, COLLECTOR_MODE_SINGLE}
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 
 
@@ -90,6 +93,7 @@ def parse_args() -> argparse.Namespace:
         description="Collect accepted/manual two-camera container OCR samples."
     )
     parser.add_argument("--config", required=True, type=Path, help="JSON collector config.")
+    parser.add_argument("--source", type=Path, default=None, help="Local test image for single-camera mode.")
     parser.add_argument("--source1", type=Path, default=None, help="Local test image for camera 1.")
     parser.add_argument("--source2", type=Path, default=None, help="Local test image for camera 2.")
     parser.add_argument("--once", action="store_true", help="Run one iteration and exit.")
@@ -124,10 +128,24 @@ def resolve_repo_path(value: str | Path | None, default: str) -> Path:
     return raw if raw.is_absolute() else (REPO_ROOT / raw).resolve()
 
 
-def parse_camera_configs(config: dict[str, Any]) -> list[CameraConfig]:
+def parse_collector_mode(config: dict[str, Any]) -> str:
+    mode = str(config.get("collector_mode") or COLLECTOR_MODE_DUAL).lower()
+    if mode not in COLLECTOR_MODES:
+        raise ValueError(
+            f"Unsupported collector_mode: {mode!r}. "
+            f"Use one of: {', '.join(sorted(COLLECTOR_MODES))}"
+        )
+    return mode
+
+
+def parse_camera_configs(config: dict[str, Any], collector_mode: str) -> list[CameraConfig]:
     raw_cameras = config.get("cameras")
-    if not isinstance(raw_cameras, list) or len(raw_cameras) != 2:
-        raise ValueError("Config must contain exactly two cameras")
+    expected_count = 1 if collector_mode == COLLECTOR_MODE_SINGLE else 2
+    if not isinstance(raw_cameras, list) or len(raw_cameras) != expected_count:
+        raise ValueError(
+            f"Config with collector_mode={collector_mode!r} must contain "
+            f"exactly {expected_count} camera(s)"
+        )
 
     cameras: list[CameraConfig] = []
     for idx, raw in enumerate(raw_cameras, start=1):
@@ -174,6 +192,16 @@ def camera_password(camera: CameraConfig) -> str | None:
     return None
 
 
+def looks_like_image(content: bytes) -> bool:
+    return (
+        content.startswith(b"\xff\xd8")  # JPEG
+        or content.startswith(b"\x89PNG\r\n\x1a\n")
+        or content.startswith(b"BM")  # BMP
+        or content.startswith((b"II*\x00", b"MM\x00*"))  # TIFF
+        or (len(content) >= 12 and content[:4] == b"RIFF" and content[8:12] == b"WEBP")
+    )
+
+
 def request_snapshot(camera: CameraConfig) -> bytes:
     url = build_snapshot_url(camera)
     user = camera.user
@@ -196,7 +224,7 @@ def request_snapshot(camera: CameraConfig) -> bytes:
                 continue
             response.raise_for_status()
             content_type = response.headers.get("content-type", "").lower()
-            if "image" not in content_type and not response.content.startswith(b"\xff\xd8"):
+            if "image" not in content_type and not looks_like_image(response.content):
                 raise ValueError(
                     f"{camera.name} response is not an image: content-type={content_type!r}"
                 )
@@ -451,6 +479,29 @@ def decide(
     return Decision("save", "manual_number_missing_or_mismatch", None, manual_category(analyses))
 
 
+def decide_single_camera(
+    analysis: Analysis,
+    *,
+    min_detections: int,
+    last_number: str | None,
+    last_manual_key: str | None,
+) -> Decision:
+    if analysis.detections_count < min_detections:
+        return Decision("skip", "not_enough_detections", None, None)
+
+    number = analysis.primary_number
+    if is_complete_number(number):
+        if last_number and number == last_number:
+            return Decision("skip", "duplicate_accepted_number", number, None)
+        return Decision("save", "accepted_single_camera_number", number, "accepted")
+
+    manual_key = manual_duplicate_key([analysis])
+    if last_manual_key and manual_key == last_manual_key:
+        return Decision("skip", "duplicate_manual_case", None, None)
+
+    return Decision("save", "manual_single_camera_number_missing", None, manual_category([analysis]))
+
+
 def analyse_captures(
     captures: Sequence[Capture],
     *,
@@ -490,6 +541,20 @@ def local_captures(cameras: Sequence[CameraConfig], source1: Path, source2: Path
             )
         )
     return captures
+
+
+def local_single_capture(camera: CameraConfig, source: Path) -> list[Capture]:
+    path = source.resolve()
+    if not path.exists():
+        raise FileNotFoundError(path)
+    return [
+        Capture(
+            camera=camera,
+            path=path,
+            source_name=path.name,
+            suffix=path.suffix if path.suffix else ".jpg",
+        )
+    ]
 
 
 def live_captures(cameras: Sequence[CameraConfig], temp_dir: Path) -> list[Capture]:
@@ -629,6 +694,78 @@ def process_iteration(
     return decision
 
 
+def process_single_camera_iteration(
+    captures: Sequence[Capture],
+    *,
+    model: YOLO,
+    class_ids: dict[str, int],
+    output_root: Path,
+    state_path: Path,
+    log_path: Path,
+    min_detections: int,
+    conf: float,
+    iou: float,
+    max_det: int,
+    merge_iou: float | None,
+    mode: str,
+    live_timestamp: datetime | None,
+) -> Decision:
+    if len(captures) != 1:
+        raise ValueError("single_camera mode expects exactly one capture")
+
+    state = load_state(state_path)
+    analyses = analyse_captures(
+        captures,
+        model=model,
+        conf=conf,
+        iou=iou,
+        max_det=max_det,
+        merge_iou=merge_iou,
+    )
+    analysis = analyses[0]
+    decision = decide_single_camera(
+        analysis,
+        min_detections=min_detections,
+        last_number=normalize_number(state.get("last_accepted_number")),
+        last_manual_key=str(state.get("last_manual_key") or ""),
+    )
+
+    saved: list[dict[str, str]] = []
+    if decision.action == "save" and decision.category:
+        saved = save_pair(
+            analyses,
+            category=decision.category,
+            output_root=output_root,
+            class_ids=class_ids,
+            live_timestamp=live_timestamp,
+        )
+        if decision.category == "accepted" and decision.number:
+            update_state(state_path, {"last_accepted_number": decision.number})
+        elif decision.category and decision.category.startswith("manual/"):
+            append_recognition_info(
+                output_root=output_root,
+                category=decision.category,
+                live_timestamp=live_timestamp,
+                analyses=analyses,
+                saved=saved,
+            )
+            update_state(state_path, {"last_manual_key": manual_duplicate_key(analyses)})
+
+    record = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "mode": mode,
+        "decision": decision.action,
+        "reason": decision.reason,
+        "category": decision.category,
+        "number": decision.number,
+        "saved": saved,
+        "cameras": [analysis_record(item) for item in analyses],
+    }
+    append_log(log_path, record)
+    print_iteration(decision, analyses)
+    return decision
+
+
 def process_single_camera_fallback(
     captures: Sequence[Capture],
     *,
@@ -704,11 +841,18 @@ def process_single_camera_fallback(
 def main() -> int:
     args = parse_args()
     config = load_json(args.config.resolve())
-    cameras = parse_camera_configs(config)
+    collector_mode = parse_collector_mode(config)
+    cameras = parse_camera_configs(config, collector_mode)
 
     source_args = [args.source1, args.source2]
-    if any(source_args) and not all(source_args):
-        raise SystemExit("--source1 and --source2 must be passed together")
+    if collector_mode == COLLECTOR_MODE_SINGLE:
+        if any(source_args):
+            raise SystemExit("Use --source in single_camera mode, not --source1/--source2")
+    else:
+        if args.source is not None:
+            raise SystemExit("Use --source1 and --source2 in dual_camera mode, not --source")
+        if any(source_args) and not all(source_args):
+            raise SystemExit("--source1 and --source2 must be passed together")
 
     weights = resolve_repo_path(config.get("weights"), DEFAULT_WEIGHTS)
     output_root = resolve_repo_path(args.output_root or config.get("output_root"), DEFAULT_OUTPUT_ROOT)
@@ -731,7 +875,26 @@ def main() -> int:
     model = YOLO(str(weights))
     class_ids = build_class_id_map(model)
 
-    if args.source1 is not None and args.source2 is not None:
+    if collector_mode == COLLECTOR_MODE_SINGLE and args.source is not None:
+        captures = local_single_capture(cameras[0], args.source)
+        process_single_camera_iteration(
+            captures,
+            model=model,
+            class_ids=class_ids,
+            output_root=output_root,
+            state_path=state_path,
+            log_path=log_path,
+            min_detections=min_detections,
+            conf=conf,
+            iou=iou,
+            max_det=max_det,
+            merge_iou=merge_iou,
+            mode="local_single_camera",
+            live_timestamp=None,
+        )
+        return 0
+
+    if collector_mode == COLLECTOR_MODE_DUAL and args.source1 is not None and args.source2 is not None:
         captures = local_captures(cameras, args.source1, args.source2)
         process_iteration(
             captures,
@@ -753,8 +916,8 @@ def main() -> int:
 
     interval_seconds = max(1.0, interval_minutes * 60.0)
     print(
-        f"Live mode: polling {len(cameras)} cameras every {interval_minutes:g} minutes; "
-        f"output={output_root}",
+        f"Live mode: {collector_mode}; polling {len(cameras)} camera(s) "
+        f"every {interval_minutes:g} minutes; output={output_root}",
         flush=True,
     )
 
@@ -763,7 +926,24 @@ def main() -> int:
         try:
             with tempfile.TemporaryDirectory(prefix="axis_dual_container_") as tmp:
                 tmp_path = Path(tmp)
-                if save_single_camera_on_error:
+                if collector_mode == COLLECTOR_MODE_SINGLE:
+                    captures = live_captures(cameras, tmp_path)
+                    process_single_camera_iteration(
+                        captures,
+                        model=model,
+                        class_ids=class_ids,
+                        output_root=output_root,
+                        state_path=state_path,
+                        log_path=log_path,
+                        min_detections=min_detections,
+                        conf=conf,
+                        iou=iou,
+                        max_det=max_det,
+                        merge_iou=merge_iou,
+                        mode="live_single_camera",
+                        live_timestamp=live_timestamp,
+                    )
+                elif save_single_camera_on_error:
                     captures, camera_errors = live_captures_partial(cameras, tmp_path)
                     if len(captures) == len(cameras):
                         process_iteration(
