@@ -1,19 +1,20 @@
 ﻿{
-  "collector_mode": "single_camera",
-  "cameras": [
-    {
-      "name": "hikrobot",
-      "url": "http://192.168.1.50:8000/capture/file?camera=0&format=png",
-      "auth": "none",
-      "timeout_seconds": 60
-    }
-  ],
-  "output_root": "datasets/hikrobot_collected",
-  "state_file": "runs/hikrobot_collector_state.json",
-  "log_jsonl": "runs/hikrobot_collector.jsonl",
-  "interval_minutes": 20,
-  "min_detections": 6,
-  "conf": 0.15,
-  "iou": 0.45,
-  "max_det": 300
+    "collector_mode":  "single_camera",
+    "cameras":  [
+                    {
+                        "name":  "hikrobot",
+                        "url":  "http://192.168.1.50:8000/capture/file?camera=0\u0026format=png",
+                        "auth":  "none",
+                        "timeout_seconds":  60
+                    }
+                ],
+    "output_root":  "datasets/hikrobot_collected",
+    "state_file":  "runs/hikrobot_collector_state.json",
+    "log_jsonl":  "runs/hikrobot_collector.jsonl",
+    "interval_minutes":  20,
+    "min_detections":  6,
+    "conf":  0.15,
+    "iou":  0.45,
+    "max_det":  300,
+    "recognizer_module":  "recogniser/read_container_KP.py"
 }

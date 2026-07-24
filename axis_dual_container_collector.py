@@ -10,6 +10,8 @@ It intentionally does not modify recogniser/read_container.py.
 from __future__ import annotations
 
 import argparse
+import importlib
+import importlib.util
 import json
 import os
 import shutil
@@ -19,6 +21,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Sequence
 
 import cv2
@@ -33,6 +36,9 @@ if str(RECOGNISER_DIR) not in sys.path:
     sys.path.insert(0, str(RECOGNISER_DIR))
 
 import read_container  # noqa: E402
+
+
+ACTIVE_RECOGNIZER_MODULE = read_container
 
 
 DEFAULT_WEIGHTS = "runs/detect/model_8_05_26_278e_26m/best.pt"
@@ -69,7 +75,7 @@ class Capture:
 @dataclass(frozen=True)
 class Analysis:
     capture: Capture
-    read: read_container.CameraRead
+    read: Any
 
     @property
     def primary_number(self) -> str:
@@ -101,6 +107,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--state-file", type=Path, default=None, help="Override config state_file.")
     parser.add_argument("--log-jsonl", type=Path, default=None, help="Override config log_jsonl.")
     parser.add_argument("--min-detections", type=int, default=None, help="Override config min_detections.")
+    parser.add_argument(
+        "--recognizer-module",
+        default=None,
+        help="Recognizer module name or .py path. Defaults to config recognizer_module or read_container.",
+    )
     parser.add_argument("--interval-minutes", type=float, default=None, help="Override polling interval.")
     parser.add_argument(
         "--no-single-camera-on-error",
@@ -113,6 +124,97 @@ def parse_args() -> argparse.Namespace:
         help="Save a two-camera sample only when both images have at least min_detections.",
     )
     return parser.parse_args()
+
+
+def load_recognizer_module(value: str | Path | None):
+    raw = str(value or "read_container")
+    raw_path = Path(raw)
+    is_path = raw_path.suffix == ".py" or any(sep in raw for sep in ("/", "\\"))
+
+    if not is_path:
+        return importlib.import_module(raw)
+
+    module_path = raw_path if raw_path.is_absolute() else (REPO_ROOT / raw_path).resolve()
+    if not module_path.exists():
+        raise FileNotFoundError(f"Recognizer module file not found: {module_path}")
+
+    module_name = module_path.stem
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load recognizer module from {module_path}")
+
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def recognizer_default_merge_iou(module) -> float:
+    return float(getattr(module, "DEFAULT_MERGE_IOU", read_container.DEFAULT_MERGE_IOU))
+
+
+def predict_with_recognizer(
+    module,
+    model: YOLO,
+    image_path: Path,
+    *,
+    conf: float,
+    iou: float,
+    max_det: int,
+    merge_iou: float | None,
+):
+    if hasattr(module, "predict_camera_read"):
+        return module.predict_camera_read(
+            model,
+            image_path,
+            conf=conf,
+            iou=iou,
+            max_det=max_det,
+            merge_iou=merge_iou,
+        )
+
+    if hasattr(module, "predict_container_kp_with_layout"):
+        text, check_ok, ordered, layout, size_type = module.predict_container_kp_with_layout(
+            model,
+            image_path,
+            conf=conf,
+            iou=iou,
+            max_det=max_det,
+            merge_iou=merge_iou,
+        )
+        return SimpleNamespace(
+            image_path=image_path,
+            primary_number=text,
+            check_ok=check_ok,
+            ordered=ordered,
+            size_type_code=size_type,
+            layout=layout,
+            char_scores=[],
+        )
+
+    if hasattr(module, "predict_container_read"):
+        read = module.predict_container_read(
+            model,
+            image_path,
+            conf=conf,
+            iou=iou,
+            max_det=max_det,
+            merge_iou=merge_iou,
+        )
+        return SimpleNamespace(
+            image_path=image_path,
+            primary_number=read.primary_number,
+            check_ok=read.check_ok,
+            ordered=read.ordered,
+            size_type_code=read.size_type_code,
+            layout=read.layout,
+            char_scores=getattr(read, "char_scores", []),
+        )
+
+    raise AttributeError(
+        f"Recognizer module {module.__name__!r} must define predict_camera_read(), "
+        "predict_container_kp_with_layout(), or predict_container_read()"
+    )
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -513,7 +615,8 @@ def analyse_captures(
 ) -> list[Analysis]:
     out: list[Analysis] = []
     for capture in captures:
-        read = read_container.predict_camera_read(
+        read = predict_with_recognizer(
+            ACTIVE_RECOGNIZER_MODULE,
             model,
             capture.path,
             conf=conf,
@@ -839,8 +942,12 @@ def process_single_camera_fallback(
 
 
 def main() -> int:
+    global ACTIVE_RECOGNIZER_MODULE
+
     args = parse_args()
     config = load_json(args.config.resolve())
+    recognizer_module_name = args.recognizer_module or config.get("recognizer_module") or "read_container"
+    ACTIVE_RECOGNIZER_MODULE = load_recognizer_module(recognizer_module_name)
     collector_mode = parse_collector_mode(config)
     cameras = parse_camera_configs(config, collector_mode)
 
@@ -866,7 +973,7 @@ def main() -> int:
     conf = float(config.get("conf", 0.15))
     iou = float(config.get("iou", 0.45))
     max_det = int(config.get("max_det", 300))
-    merge_iou_raw = float(config.get("merge_iou", read_container.DEFAULT_MERGE_IOU))
+    merge_iou_raw = float(config.get("merge_iou", recognizer_default_merge_iou(ACTIVE_RECOGNIZER_MODULE)))
     merge_iou = None if merge_iou_raw <= 0 else merge_iou_raw
     save_single_camera_on_error = bool(config.get("save_single_camera_on_error", True))
     if args.no_single_camera_on_error:
@@ -916,8 +1023,9 @@ def main() -> int:
 
     interval_seconds = max(1.0, interval_minutes * 60.0)
     print(
-        f"Live mode: {collector_mode}; polling {len(cameras)} camera(s) "
-        f"every {interval_minutes:g} minutes; output={output_root}",
+        f"Live mode: {collector_mode}; recognizer={ACTIVE_RECOGNIZER_MODULE.__name__}; "
+        f"polling {len(cameras)} camera(s) every {interval_minutes:g} minutes; "
+        f"output={output_root}",
         flush=True,
     )
 
