@@ -569,7 +569,8 @@ def decide(
 
     numbers = [analysis.primary_number for analysis in analyses]
     both_complete = all(is_complete_number(number) for number in numbers)
-    if both_complete and numbers[0] == numbers[1]:
+    both_verified = all(has_check_ok_number(analysis) for analysis in analyses)
+    if both_complete and both_verified and numbers[0] == numbers[1]:
         if last_number and numbers[0] == last_number:
             return Decision("skip", "duplicate_accepted_number", numbers[0], None)
         return Decision("save", "accepted_number_match", numbers[0], "accepted")
@@ -592,7 +593,7 @@ def decide_single_camera(
         return Decision("skip", "not_enough_detections", None, None)
 
     number = analysis.primary_number
-    if is_complete_number(number):
+    if is_complete_number(number) and has_check_ok_number(analysis):
         if last_number and number == last_number:
             return Decision("skip", "duplicate_accepted_number", number, None)
         return Decision("save", "accepted_single_camera_number", number, "accepted")
