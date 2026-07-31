@@ -21,7 +21,6 @@ class MinioService:
         data: bytes,
         content_type: str = "application/octet-stream",
         scenario_name: str | None = None,
-        request_id: str | None = None,
         filename: str | None = None,
     ) -> str:
         file_id = str(uuid.uuid4())
@@ -33,8 +32,6 @@ class MinioService:
             if not safe_scenario:
                 raise ValueError("Scenario name must contain letters or digits")
             parts.append(safe_scenario[:128])
-        if request_id:
-            parts.append(request_id)
         if filename and "." in filename:
             extension = filename.rsplit(".", 1)[-1].lower()
             parts.append(f"{file_id}.{extension}")

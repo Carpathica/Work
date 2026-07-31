@@ -230,7 +230,6 @@ async def _process_yolo_request(
             image["content"],
             content_type=image["content_type"] or "application/octet-stream",
             scenario_name=scenario_name,
-            request_id=str(request_id),
             filename=image["filename"],
         )
         file_info.append(

@@ -137,7 +137,6 @@ async def process_recognition_request(
             img_bytes,
             content_type=content_type or "application/octet-stream",
             scenario_name=scenario_name,
-            request_id=str(request_id),
         )
         file_info.append({"file_id": file_id, "content_type": content_type})
         
