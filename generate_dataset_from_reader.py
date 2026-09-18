@@ -32,6 +32,7 @@
 - Y / y / Enter / Space — сохранить (распознано правильно)
 - E / e — исправить номер и type/size прямо в окне предпросмотра
 - N / n — пропустить (распознано неправильно)
+- U / u — перейти к следующему неразмеченному изображению
 - Q / q / Esc — выйти
 """
 from __future__ import annotations
@@ -203,6 +204,14 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Ограничение количества изображений"
+    )
+    parser.add_argument(
+        "--start-unannotated",
+        action="store_true",
+        help=(
+            "В режиме одиночных изображений сразу перейти к первому кадру, которого ещё нет в dataset.jsonl "
+            "(в интерактивном окне та же команда доступна по U)"
+        ),
     )
     parser.add_argument(
         "--no-interactive",
@@ -532,7 +541,12 @@ def collector_pair_samples(
     return samples
 
 
-def make_pair_preview(sample: Dict[str, Any], expected: Dict[str, str]) -> Optional[Any]:
+def make_pair_preview(
+    sample: Dict[str, Any],
+    expected: Dict[str, str],
+    current_index: Optional[int] = None,
+    total: Optional[int] = None,
+) -> Optional[Any]:
     if not HAS_CV:
         return None
     frames = []
@@ -572,6 +586,8 @@ def make_pair_preview(sample: Dict[str, Any], expected: Dict[str, str]) -> Optio
             "Left/A previous | Right/D next | Q/Esc quit",
         ]
     )
+    if current_index is not None and total is not None:
+        lines.insert(0, f"FRAME: {current_index}/{total}  remaining: {max(total - current_index, 0)}")
 
     font_scale = min(0.9, max(0.5, canvas.shape[1] / 1500))
     thickness = max(1, int(2 * font_scale))
@@ -583,8 +599,13 @@ def make_pair_preview(sample: Dict[str, Any], expected: Dict[str, str]) -> Optio
     return canvas
 
 
-def show_pair_preview(sample: Dict[str, Any], expected: Dict[str, str]) -> Optional[str]:
-    frame = make_pair_preview(sample, expected)
+def show_pair_preview(
+    sample: Dict[str, Any],
+    expected: Dict[str, str],
+    current_index: Optional[int] = None,
+    total: Optional[int] = None,
+) -> Optional[str]:
+    frame = make_pair_preview(sample, expected, current_index, total)
     if frame is None:
         return None
     cv2.namedWindow(PREVIEW_WINDOW_NAME, cv2.WINDOW_NORMAL)
@@ -682,7 +703,7 @@ def run_collector_pair_builder(
         if args.no_interactive:
             decision = "save"
         else:
-            decision = show_pair_preview(sample, expected)
+            decision = show_pair_preview(sample, expected, idx + 1, len(samples))
 
         if decision == "quit":
             break
@@ -695,7 +716,11 @@ def run_collector_pair_builder(
         if decision == "refresh":
             continue
         if decision == "edit":
-            edited = edit_expected_in_window(expected, valid_type_codes)
+            edited = edit_expected_in_window(
+                expected,
+                valid_type_codes,
+                make_pair_preview(sample, expected, idx + 1, len(samples)),
+            )
             if edited is None:
                 continue
             expected = edited
@@ -882,6 +907,7 @@ def build_full_code(expected: Dict[str, str]) -> str:
 def edit_expected_in_window(
     expected: Dict[str, str],
     valid_type_codes: Set[str],
+    preview_frame: Optional[Any] = None,
 ) -> Optional[Dict[str, str]]:
     """Edit fields in the OpenCV window without blocking its event loop.
 
@@ -898,12 +924,33 @@ def edit_expected_in_window(
     field_selected = [True, True]
     fields = [("Container number", 11), ("Type / size code", 4)]
 
+    if preview_frame is not None:
+        preview_height, preview_width = preview_frame.shape[:2]
+        preview_scale = min(1.0, 1280 / max(preview_width, 1), 620 / max(preview_height, 1))
+        if preview_scale != 1.0:
+            preview_frame = cv2.resize(
+                preview_frame,
+                (
+                    max(1, int(preview_width * preview_scale)),
+                    max(1, int(preview_height * preview_scale)),
+                ),
+            )
+        preview_height, preview_width = preview_frame.shape[:2]
+    else:
+        preview_height = 0
+        preview_width = 0
+
     while True:
-        canvas = np.full((360, 960, 3), (35, 35, 35), dtype=np.uint8)
+        panel_top = preview_height
+        canvas_width = max(960, preview_width)
+        canvas = np.full((panel_top + 360, canvas_width, 3), (35, 35, 35), dtype=np.uint8)
+        if preview_frame is not None:
+            image_x = (canvas_width - preview_width) // 2
+            canvas[:preview_height, image_x:image_x + preview_width] = preview_frame
         cv2.putText(
             canvas,
             "Edit recognised values",
-            (35, 48),
+            (35, panel_top + 48),
             cv2.FONT_HERSHEY_SIMPLEX,
             1.0,
             (110, 255, 110),
@@ -913,7 +960,7 @@ def edit_expected_in_window(
         cv2.putText(
             canvas,
             "Type to replace field   Tab: switch field   Enter: save   Esc: cancel   Backspace: erase",
-            (35, 82),
+            (35, panel_top + 82),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.54,
             (220, 220, 220),
@@ -923,7 +970,7 @@ def edit_expected_in_window(
 
         values = [number, type_size]
         for index, (label, _max_length) in enumerate(fields):
-            y = 125 + index * 95
+            y = panel_top + 125 + index * 95
             is_active = index == active_field
             border = (90, 230, 255) if is_active else (120, 120, 120)
             cv2.putText(canvas, label, (40, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, border, 2, cv2.LINE_AA)
@@ -946,7 +993,7 @@ def edit_expected_in_window(
         cv2.putText(
             canvas,
             f"ISO check: {iso6346_check_ok(number)}   Type code valid: {status['ok']}",
-            (40, 332),
+            (40, panel_top + 332),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.62,
             (180, 180, 255),
@@ -1080,10 +1127,65 @@ def load_existing_case_ids(dataset_path: Path) -> Set[str]:
     return ids
 
 
+def image_path_key(path_value: Any) -> str:
+    """Return a stable, case-insensitive path key for Windows dataset files."""
+    try:
+        return str(Path(str(path_value)).resolve()).casefold()
+    except (OSError, ValueError):
+        return str(path_value).casefold()
+
+
+def load_annotated_source_images(dataset_path: Path) -> Set[str]:
+    """Read source-image paths already represented by single-image dataset cases."""
+    if not dataset_path.exists():
+        return set()
+
+    image_paths: Set[str] = set()
+    for line in dataset_path.read_text(encoding="utf-8-sig").splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(row, dict):
+            continue
+        metadata = row.get("metadata")
+        if isinstance(metadata, dict):
+            source_image = metadata.get("source_image")
+            if isinstance(source_image, str) and source_image.strip():
+                image_paths.add(image_path_key(source_image))
+        image = row.get("image")
+        if isinstance(image, str) and Path(image).is_absolute():
+            image_paths.add(image_path_key(image))
+    return image_paths
+
+
+def find_next_unannotated_sample(
+    samples: List[Dict[str, Any]],
+    start_index: int,
+    annotated_image_paths: Set[str],
+    saved_indices: Set[int],
+) -> Optional[int]:
+    """Find an unannotated sample, wrapping around the current list once."""
+    if not samples:
+        return None
+    for offset in range(len(samples)):
+        index = (start_index + offset) % len(samples)
+        if index in saved_indices:
+            continue
+        image_path = samples[index].get("image_path")
+        if image_path is None or image_path_key(image_path) not in annotated_image_paths:
+            return index
+    return None
+
+
 def create_annotated_image(
     image_path: Path,
     result: Dict[str, Any],
-    expected: Dict[str, str]
+    expected: Dict[str, str],
+    current_index: Optional[int] = None,
+    total: Optional[int] = None,
 ) -> Optional[Any]:
     """Создать изображение с аннотацией результата."""
     if not HAS_CV:
@@ -1120,6 +1222,11 @@ def create_annotated_image(
     type_check_text = "-" if type_size_ok is None else str(bool(type_size_ok))
     
     lines = [
+        (
+            f"FRAME: {current_index}/{total} | remaining: {max(total - current_index, 0)}"
+            if current_index is not None and total is not None
+            else ""
+        ),
         f"ISO: {iso_code}",
         f"Full: {full_code}",
         f"Type/Size: {type_size}",
@@ -1129,6 +1236,7 @@ def create_annotated_image(
         "Y/Enter/Space = сохранить",
         "E = исправить номер/type_size и сохранить",
         "N = пропустить (неправильно)",
+        "U = перейти к следующему неразмеченному",
         "Q/Esc = выход"
     ]
     
@@ -1164,7 +1272,13 @@ def create_annotated_image(
     return frame
 
 
-def show_preview(image_path: Path, result: Dict[str, Any], expected: Dict[str, str]) -> Optional[str]:
+def show_preview(
+    image_path: Path,
+    result: Dict[str, Any],
+    expected: Dict[str, str],
+    current_index: Optional[int] = None,
+    total: Optional[int] = None,
+) -> Optional[str]:
     """
     Показать предпросмотр с результатом распознавания.
     Возвращает "save", "skip", "edit" или None если выйти.
@@ -1173,7 +1287,7 @@ def show_preview(image_path: Path, result: Dict[str, Any], expected: Dict[str, s
         print("[warn] OpenCV не установлен. Используйте --no-interactive для автоматического режима.")
         return None
     
-    frame = create_annotated_image(image_path, result, expected)
+    frame = create_annotated_image(image_path, result, expected, current_index, total)
     if frame is None:
         return None
     
@@ -1193,6 +1307,8 @@ def show_preview(image_path: Path, result: Dict[str, Any], expected: Dict[str, s
         return "skip"
     elif key_char in (ord("e"), ord("E")):
         return "edit"
+    elif key_char in (ord("u"), ord("U")):
+        return "unannotated"
     elif key_char in (ord("a"), ord("A"), ord("b"), ord("B"), ord("p"), ord("P")) or key in (KEY_LEFT, KEY_PAGE_UP):
         return "prev"
     elif key_char in (ord("d"), ord("D")) or key in (KEY_RIGHT, KEY_PAGE_DOWN):
@@ -1335,10 +1451,11 @@ def main() -> int:
     print(f"[info] режим: {'интерактивный' if not args.no_interactive else 'автоматический'}")
     
     if not args.no_interactive:
-        print("[info] управление: Y=сохранить, N=пропустить, Q=выход")
+        print("[info] управление: Y=сохранить, N=пропустить, U=следующее неразмеченное, Q=выход")
     
     # Загрузка существующих ID
     existing_ids = load_existing_case_ids(dataset_path)
+    annotated_image_paths = load_annotated_source_images(dataset_path)
     
     processed = 0
     saved = 0
@@ -1348,6 +1465,20 @@ def main() -> int:
     saved_indices: Set[int] = set()
     
     idx = 0
+    if args.start_unannotated:
+        start_idx = find_next_unannotated_sample(
+            samples,
+            start_index=0,
+            annotated_image_paths=annotated_image_paths,
+            saved_indices=saved_indices,
+        )
+        if start_idx is None:
+            print("[info] все изображения из текущей выборки уже размечены")
+            idx = len(samples)
+        elif start_idx:
+            idx = start_idx
+            print(f"[info] переход к первому неразмеченному: {idx + 1}/{len(samples)}")
+
     while idx < len(samples):
         sample = samples[idx]
         display_idx = idx + 1
@@ -1400,7 +1531,7 @@ def main() -> int:
             print("[auto] автоматическое сохранение")
         else:
             # Интерактивный режим
-            decision = show_preview(image_path, result, expected)
+            decision = show_preview(image_path, result, expected, display_idx, len(samples))
             
             if decision == "quit":
                 print("[quit] выход по запросу пользователя")
@@ -1413,8 +1544,25 @@ def main() -> int:
                 continue
             elif decision == "refresh":
                 continue
+            elif decision == "unannotated":
+                target_idx = find_next_unannotated_sample(
+                    samples,
+                    start_index=idx + 1,
+                    annotated_image_paths=annotated_image_paths,
+                    saved_indices=saved_indices,
+                )
+                if target_idx is None or target_idx == idx:
+                    print("[info] неразмеченных изображений больше нет")
+                else:
+                    idx = target_idx
+                    print(f"[info] переход к неразмеченному: {idx + 1}/{len(samples)}")
+                continue
             elif decision == "edit":
-                edited = edit_expected_in_window(expected, valid_type_codes)
+                edited = edit_expected_in_window(
+                    expected,
+                    valid_type_codes,
+                    create_annotated_image(image_path, result, expected, display_idx, len(samples)),
+                )
                 if edited is None:
                     continue
                 expected = edited
@@ -1483,6 +1631,7 @@ def main() -> int:
         
         saved += 1
         saved_indices.add(idx)
+        annotated_image_paths.add(image_path_key(image_path))
         idx += 1
         print(f"[save] {case_id} | ISO: {iso or '(пусто)'}")
     
