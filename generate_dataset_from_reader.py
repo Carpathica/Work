@@ -30,6 +30,7 @@
 
 Управление:
 - Y / y / Enter / Space — сохранить (распознано правильно)
+- E / e — исправить номер и type/size прямо в окне предпросмотра
 - N / n — пропустить (распознано неправильно)
 - Q / q / Esc — выйти
 """
@@ -47,6 +48,7 @@ from typing import Any, Dict, List, Optional, Set
 
 try:
     import cv2
+    import numpy as np
     HAS_CV = True
 except ImportError:
     HAS_CV = False
@@ -115,10 +117,19 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="JSONL логи axis_dual_container_collector.py; используются уже сохраненные детекции"
     )
-    parser.add_argument(
+    collector_layout_group = parser.add_mutually_exclusive_group()
+    collector_layout_group.add_argument(
         "--collector-pairs",
         action="store_true",
         help="В режиме --collector-jsonl создавать один evaluate_accuracy case на пару cam1+cam2"
+    )
+    collector_layout_group.add_argument(
+        "--collector-singles",
+        action="store_true",
+        help=(
+            "В режиме --collector-jsonl создавать case для каждого отдельного изображения "
+            "(режим по умолчанию; подходит для площадки с одной камерой)"
+        ),
     )
     parser.add_argument(
         "--valid-type-codes",
@@ -684,7 +695,10 @@ def run_collector_pair_builder(
         if decision == "refresh":
             continue
         if decision == "edit":
-            expected = edit_expected_in_console(expected, valid_type_codes)
+            edited = edit_expected_in_window(expected, valid_type_codes)
+            if edited is None:
+                continue
+            expected = edited
             sample["expected"] = expected
             decision = "save"
         if decision == "skip":
@@ -865,31 +879,127 @@ def build_full_code(expected: Dict[str, str]) -> str:
     return iso.strip()
 
 
-def edit_expected_in_console(expected: Dict[str, str], valid_type_codes: Set[str]) -> Dict[str, str]:
-    """Let the user correct number/type in the terminal while the preview is paused."""
-    current_number = build_iso_code(expected)
-    current_type = expected.get("type_size_code", "")
-    print("\n[edit] Press Enter to keep the current value, '-' to clear it.")
-    number = input(f"[edit] container number [{current_number}]: ").strip()
-    if number == "":
-        number = current_number
-    elif number == "-":
-        number = ""
-    type_size = input(f"[edit] type_size [{current_type}]: ").strip()
-    if type_size == "":
-        type_size = current_type
-    elif type_size == "-":
-        type_size = ""
+def edit_expected_in_window(
+    expected: Dict[str, str],
+    valid_type_codes: Set[str],
+) -> Optional[Dict[str, str]]:
+    """Edit fields in the OpenCV window without blocking its event loop.
 
-    corrected = split_expected(number, type_size)
-    status = type_size_check(corrected.get("type_size_code", ""), valid_type_codes)
-    print(
-        "[edit] corrected: "
-        f"ISO={build_iso_code(corrected) or '(empty)'}, "
-        f"type_size={corrected.get('type_size_code', '') or '(empty)'}, "
-        f"type_ok={status['ok']}"
-    )
-    return corrected
+    ``input()`` pauses the thread that pumps OpenCV window messages.  Keeping
+    the editor in a short ``waitKeyEx`` loop means the window can still be
+    moved, minimised and redrawn while the user types.
+    """
+    if not HAS_CV:
+        return None
+
+    number = normalize_text(build_iso_code(expected))
+    type_size = normalize_text(expected.get("type_size_code", ""))
+    active_field = 0
+    field_selected = [True, True]
+    fields = [("Container number", 11), ("Type / size code", 4)]
+
+    while True:
+        canvas = np.full((360, 960, 3), (35, 35, 35), dtype=np.uint8)
+        cv2.putText(
+            canvas,
+            "Edit recognised values",
+            (35, 48),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.0,
+            (110, 255, 110),
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            canvas,
+            "Type to replace field   Tab: switch field   Enter: save   Esc: cancel   Backspace: erase",
+            (35, 82),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.54,
+            (220, 220, 220),
+            1,
+            cv2.LINE_AA,
+        )
+
+        values = [number, type_size]
+        for index, (label, _max_length) in enumerate(fields):
+            y = 125 + index * 95
+            is_active = index == active_field
+            border = (90, 230, 255) if is_active else (120, 120, 120)
+            cv2.putText(canvas, label, (40, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, border, 2, cv2.LINE_AA)
+            cv2.rectangle(canvas, (35, y + 15), (925, y + 70), border, 2)
+            value = values[index]
+            cursor = "|" if is_active else ""
+            cv2.putText(
+                canvas,
+                value + cursor,
+                (52, y + 54),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.0,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+
+        corrected = split_expected(number, type_size)
+        status = type_size_check(corrected.get("type_size_code", ""), valid_type_codes)
+        cv2.putText(
+            canvas,
+            f"ISO check: {iso6346_check_ok(number)}   Type code valid: {status['ok']}",
+            (40, 332),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.62,
+            (180, 180, 255),
+            1,
+            cv2.LINE_AA,
+        )
+        cv2.namedWindow(PREVIEW_WINDOW_NAME, cv2.WINDOW_NORMAL)
+        cv2.imshow(PREVIEW_WINDOW_NAME, canvas)
+
+        key = cv2.waitKeyEx(50)
+        try:
+            if cv2.getWindowProperty(PREVIEW_WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
+                return None
+        except cv2.error:
+            return None
+        if key == -1:
+            continue
+
+        key_char = key & 0xFF
+        if key_char == 27:  # Esc
+            return None
+        if key_char in (13, 10):  # Enter
+            return corrected
+        if key_char == 9 or key in (2490368, 2621440):  # Tab, Up, Down
+            active_field = 1 - active_field
+            continue
+        if key_char in (8, 127):  # Backspace/Delete
+            if active_field == 0:
+                number = "" if field_selected[active_field] else number[:-1]
+            else:
+                type_size = "" if field_selected[active_field] else type_size[:-1]
+            field_selected[active_field] = False
+            continue
+
+        try:
+            character = chr(key_char).upper()
+        except ValueError:
+            continue
+        if character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789":
+            continue
+        _label, max_length = fields[active_field]
+        if active_field == 0:
+            if field_selected[active_field]:
+                number = ""
+                field_selected[active_field] = False
+            if len(number) < max_length:
+                number += character
+        else:
+            if field_selected[active_field]:
+                type_size = ""
+                field_selected[active_field] = False
+            if len(type_size) < max_length:
+                type_size += character
 
 
 def save_case(
@@ -1219,6 +1329,8 @@ def main() -> int:
     if collector_mode:
         print(f"[info] collector JSONL: {', '.join(str(p.resolve()) for p in args.collector_jsonl)}")
         print(f"[info] valid type_size codes: {len(valid_type_codes)}")
+        collector_layout = "pairs" if args.collector_pairs else "single images"
+        print(f"[info] collector layout: {collector_layout}")
     print(f"[info] вывод: {output_dir}")
     print(f"[info] режим: {'интерактивный' if not args.no_interactive else 'автоматический'}")
     
@@ -1302,7 +1414,10 @@ def main() -> int:
             elif decision == "refresh":
                 continue
             elif decision == "edit":
-                expected = edit_expected_in_console(expected, valid_type_codes)
+                edited = edit_expected_in_window(expected, valid_type_codes)
+                if edited is None:
+                    continue
+                expected = edited
                 result["result"] = format_container_result_like_reader(expected)
                 sample["expected"] = expected
                 sample["result"] = result
@@ -1382,6 +1497,7 @@ def main() -> int:
         "model": str(model_path) if model_path is not None else "",
         "source": str(source_path) if source_path is not None else "",
         "collector_jsonl": [str(path.resolve()) for path in args.collector_jsonl] if collector_mode else [],
+        "collector_layout": "pairs" if args.collector_pairs else "single_images" if collector_mode else "",
         "output_dir": str(output_dir),
         "dataset_file": str(dataset_path),
         "images_total": len(samples),
