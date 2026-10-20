@@ -1,0 +1,16 @@
+{
+  "state_api_url": "https://akskgmkords01.npr.nornick.ru/ords/devtest/vis_cmto/state",
+  "poll_interval_seconds": 1,
+  "timeout_seconds": 10,
+  "output_root": "dataset",
+  "cameras": {
+    "left": {
+      "name": "camera1",
+      "snapshot_url": "http://CAMERA_1_IP/axis-cgi/jpg/image.cgi"
+    },
+    "right": {
+      "name": "camera2",
+      "snapshot_url": "http://CAMERA_2_IP/axis-cgi/jpg/image.cgi"
+    }
+  }
+}
