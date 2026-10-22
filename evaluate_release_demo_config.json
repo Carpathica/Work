@@ -1,0 +1,9 @@
+{
+  "base_url": "http://SERVER:8899",
+  "username": "admin@example.com",
+  "password": "admin123@pass!",
+  "dataset_root": "dataset",
+  "timeout_seconds": 120,
+  "plate_response_label": "plate_number",
+  "report_dir": "reports"
+}
