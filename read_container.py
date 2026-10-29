@@ -25,7 +25,7 @@ DEBUG_WINDOW_NAME = "ISO6346 debug"
 DEFAULT_MERGE_IOU = 0.35
 
 # Бокс удаляется, если расстояние до ближайшего соседа > factor × медианный размер символа (фильтрация выбросов)
-OUTLIER_MAX_NEAREST_NEIGHBOR_FACTOR = 4.0
+OUTLIER_MAX_NEAREST_NEIGHBOR_FACTOR = 6.0
 
 # Код типа контейнера ISO
 _AUX_SIZE_TYPE_4 = re.compile(r"^[0-9]{2}[A-Z0-9][0-9]$")
@@ -79,6 +79,8 @@ _LAYOUT_TIEBREAK_PRIORITY: dict[str, int] = {
     "horizontal_three": 3,
     "horizontal_two": 4,
     "vertical_two_columns": 5,
+    "horizontal_inline_aux": 6,
+    "horizontal_stacked_aux": 7,
 }
 
 
@@ -321,6 +323,103 @@ def sort_horizontal_one_line(dets: Iterable[Detection]) -> list[Detection]:
     return sorted(dets, key=lambda d: d.cx)
 
 
+# Разделить строку на смысловые группы по заметному горизонтальному разрыву.
+# На полуконтейнерах код типа (например, 28U1) часто расположен в той же
+# горизонтальной строке, что и NMKU, но отделён от него большим промежутком.
+def _split_line_on_wide_gaps(line: list[Detection]) -> list[list[Detection]]:
+    if not line:
+        return []
+    ordered = sort_horizontal_one_line(line)
+    widths = [_det_hw(d)[1] for d in ordered]
+    med_width = max(1.0, _median(widths))
+    # Между символами одного текста промежутки обычно меньше ширины символа;
+    # для отдельной маркировки оставлен запас, чтобы не разрезать сам номер.
+    min_gap = med_width * 1.5
+    groups: list[list[Detection]] = [[ordered[0]]]
+    for prev, current in zip(ordered, ordered[1:]):
+        gap = float(current.xyxy[0] - prev.xyxy[2])
+        if gap > min_gap:
+            groups.append([current])
+        else:
+            groups[-1].append(current)
+    return groups
+
+
+# Вернуть все непрерывные фрагменты строки, разбитой на группы. Включаются
+# только фрагменты, содержащие хотя бы один символ.
+def _line_group_spans(groups: list[list[Detection]]) -> list[tuple[int, int, list[Detection]]]:
+    spans: list[tuple[int, int, list[Detection]]] = []
+    for start in range(len(groups)):
+        current: list[Detection] = []
+        for end in range(start, len(groups)):
+            current += groups[end]
+            spans.append((start, end, current))
+    return spans
+
+
+# Раскладка полуконтейнера: ISO-номер в двух строках, а код типа находится
+# отдельной группой в одной из них (например: "28U1    NMKU" / "6197989").
+def _reading_from_horizontal_inline_auxiliary(
+    dets: list[Detection],
+) -> tuple[str, bool, list[Detection], str | None] | None:
+    lines = cluster_detections_into_lines(dets)
+    if len(lines) < 2:
+        return None
+
+    groups_by_line = [_split_line_on_wide_gaps(line) for line in lines]
+    # Нет отдельной группы в строках — это не данная раскладка.
+    if not any(len(groups) > 1 for groups in groups_by_line):
+        return None
+
+    best: tuple[int, str, bool, list[Detection], str | None] | None = None
+    for top_i in range(len(lines) - 1):
+        for bottom_i in range(top_i + 1, len(lines)):
+            top_groups = groups_by_line[top_i]
+            bottom_groups = groups_by_line[bottom_i]
+            for top_start, top_end, top_part in _line_group_spans(top_groups):
+                for bottom_start, bottom_end, bottom_part in _line_group_spans(bottom_groups):
+                    main = top_part + bottom_part
+                    text = _join_labels(main, normalized=True)
+                    if not iso6346_number_format_valid(text):
+                        continue
+
+                    selected = {
+                        (top_i, group_i)
+                        for group_i in range(top_start, top_end + 1)
+                    } | {
+                        (bottom_i, group_i)
+                        for group_i in range(bottom_start, bottom_end + 1)
+                    }
+                    aux_groups = [
+                        group
+                        for line_i, groups in enumerate(groups_by_line)
+                        for group_i, group in enumerate(groups)
+                        if (line_i, group_i) not in selected
+                    ]
+                    aux_candidates = [
+                        _join_labels(group, normalized=True) for group in aux_groups
+                    ]
+                    aux = next(
+                        (value for value in aux_candidates if _is_aux_size_type_code(value)),
+                        None,
+                    )
+                    check_ok = iso6346_check_valid(text)
+                    score = 300 if check_ok else 0
+                    if aux:
+                        score += 200
+                    # Предпочесть вариант, который использует больше символов
+                    # номера, если формат и проверка равны.
+                    score += len(main)
+                    ordered = main + [d for group in aux_groups for d in group]
+                    if best is None or score > best[0]:
+                        best = (score, text, check_ok, ordered, aux)
+
+    if best is None:
+        return None
+    _, text, check_ok, ordered, aux = best
+    return text, check_ok, ordered, aux
+
+
 # 4 буквы владельца слева и 7 символов справа (раскладка split_owner_four)
 def try_split_owner_four(dets: list[Detection]) -> tuple[list[Detection], str] | None:
     if len(dets) < 11:
@@ -348,6 +447,16 @@ def try_split_owner_four(dets: list[Detection]) -> tuple[list[Detection], str] |
 
 # Собрать 11-символьный номер и код типа контейнера из двух строк
 def _pick_primary_iso_from_two_lines(top: str, bottom: str) -> tuple[str, str | None]:
+    # Обычная двухстрочная маркировка: верхняя строка NMKU, нижняя — 7 цифр.
+    # В этом случае порядок строк нельзя менять только потому, что нижняя
+    # строка длиннее.
+    if len(top) + len(bottom) == 11:
+        return top + bottom, None
+    if len(top) == 11:
+        return top, bottom or None
+    if len(bottom) == 11:
+        return bottom, top or None
+
     a, b = top, bottom
     if len(b) > len(a):
         a, b = b, a
@@ -359,6 +468,46 @@ def _pick_primary_iso_from_two_lines(top: str, bottom: str) -> tuple[str, str | 
     if len(a) + len(b) == 11:
         return a + b, None
     return a + b, code_line
+
+
+# Раскладка с несколькими короткими строками: NMKU / 619 / 838 / 9 / 28U1.
+# Первые четыре строки дают ISO-номер, последняя — код типа контейнера.
+def _reading_from_horizontal_stacked_auxiliary(
+    dets: list[Detection],
+) -> tuple[str, bool, list[Detection], str | None] | None:
+    lines = cluster_detections_into_lines(dets)
+    if len(lines) < 3:
+        return None
+
+    best: tuple[int, str, bool, list[Detection], str] | None = None
+    for start in range(len(lines)):
+        main: list[Detection] = []
+        for end in range(start, len(lines)):
+            main += lines[end]
+            text = _join_labels(main, normalized=True)
+            if len(text) > 11:
+                break
+            if not iso6346_number_format_valid(text):
+                continue
+
+            aux_lines = lines[:start] + lines[end + 1 :]
+            aux_values = [_join_labels(line, normalized=True) for line in aux_lines]
+            aux = next(
+                (value for value in aux_values if _is_aux_size_type_code(value)),
+                None,
+            )
+            if aux is None:
+                continue
+            check_ok = iso6346_check_valid(text)
+            score = (300 if check_ok else 0) + 200 + len(main)
+            ordered = main + [d for line in aux_lines for d in line]
+            if best is None or score > best[0]:
+                best = (score, text, check_ok, ordered, aux)
+
+    if best is None:
+        return None
+    _, text, check_ok, ordered, aux = best
+    return text, check_ok, ordered, aux
 
 
 # Две вертикальные колонки в одной плоскости (vertical_two_columns)
@@ -461,6 +610,8 @@ def _layout_candidate_score(
     if size_type_line and _is_aux_size_type_code(size_type_line):
         score += {
             "vertical_two_columns": 450,
+            "horizontal_inline_aux": 425,
+            "horizontal_stacked_aux": 425,
             "horizontal_two": 400,
             "horizontal_three": 350,
         }.get(layout, 0)
@@ -525,6 +676,16 @@ def _collect_layout_candidates(
     dets: list[Detection], core: list[Detection]
 ) -> list[tuple[str, str, bool, list[Detection], str | None]]:
     out: list[tuple[str, str, bool, list[Detection], str | None]] = []
+
+    inline_aux = _reading_from_horizontal_inline_auxiliary(dets)
+    if inline_aux is not None:
+        text, ok, ordered, st = inline_aux
+        out.append(("horizontal_inline_aux", text, ok, ordered, st))
+
+    stacked_aux = _reading_from_horizontal_stacked_auxiliary(dets)
+    if stacked_aux is not None:
+        text, ok, ordered, st = stacked_aux
+        out.append(("horizontal_stacked_aux", text, ok, ordered, st))
 
     vcols = _reading_from_vertical_two_columns(dets)
     if vcols is not None:
