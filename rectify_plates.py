@@ -58,9 +58,25 @@ def parse_args() -> argparse.Namespace:
         default=0.25,
         help="Minimum YOLO confidence in the range 0..1 (default: 0.25).",
     )
+    parser.add_argument(
+        "--imgsz",
+        type=int,
+        default=1280,
+        help="YOLO inference size; 1280 preserves more plate detail on large images.",
+    )
+    parser.add_argument(
+        "--upscale",
+        type=int,
+        default=3,
+        help="Scale factor for OCR-ready variants (default: 3).",
+    )
     args = parser.parse_args()
     if not 0.0 <= args.conf <= 1.0:
         parser.error("--conf must be between 0 and 1")
+    if args.imgsz < 32:
+        parser.error("--imgsz must be at least 32")
+    if args.upscale < 1:
+        parser.error("--upscale must be at least 1")
     return args
 
 
@@ -91,6 +107,16 @@ def unique_jpeg_path(directory: Path, stem: str) -> Path:
     index = 1
     while candidate.exists():
         candidate = directory / f"{stem}_{index}.jpg"
+        index += 1
+    return candidate
+
+
+def unique_report_path(directory: Path) -> Path:
+    """Return an unused CSV report path without replacing an earlier report."""
+    candidate = directory / "report.csv"
+    index = 1
+    while candidate.exists():
+        candidate = directory / f"report_{index}.csv"
         index += 1
     return candidate
 
@@ -205,6 +231,27 @@ def rectify_crop(crop: np.ndarray) -> tuple[np.ndarray, str]:
     return crop, "crop_fallback"
 
 
+def ocr_variants(crop: np.ndarray, upscale: int) -> dict[str, np.ndarray]:
+    """Create conservative OCR inputs without perspective-warp artefacts.
+
+    The colour crop is retained separately.  These variants make no geometric
+    change: they only convert to grayscale, improve local contrast, and upscale.
+    """
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+    adaptive = cv2.adaptiveThreshold(
+        clahe, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 7
+    )
+    if upscale == 1:
+        return {"gray": gray, "clahe": clahe, "adaptive": adaptive}
+    size = (gray.shape[1] * upscale, gray.shape[0] * upscale)
+    return {
+        "gray": cv2.resize(gray, size, interpolation=cv2.INTER_CUBIC),
+        "clahe": cv2.resize(clahe, size, interpolation=cv2.INTER_CUBIC),
+        "adaptive": cv2.resize(adaptive, size, interpolation=cv2.INTER_NEAREST),
+    }
+
+
 def clamp_crop(image: np.ndarray, xyxy: np.ndarray) -> tuple[np.ndarray | None, tuple[int, int, int, int]]:
     """Expand a detection by 10 px on every side, clamped to image boundaries."""
     height, width = image.shape[:2]
@@ -218,16 +265,24 @@ def clamp_crop(image: np.ndarray, xyxy: np.ndarray) -> tuple[np.ndarray | None, 
     return image[top:bottom, left:right].copy(), (left, top, right, bottom)
 
 
-def process_image(model: YOLO, image_path: Path, conf: float, crop_dir: Path, rectified_dir: Path) -> dict[str, object]:
+def process_image(
+    model: YOLO,
+    image_path: Path,
+    conf: float,
+    imgsz: int,
+    upscale: int,
+    crop_dir: Path,
+    ocr_dirs: dict[str, Path],
+) -> dict[str, object]:
     record: dict[str, object] = {
-        "input_file": str(image_path), "confidence": "", "bbox_xyxy": "", "method": "", "crop_file": "", "rectified_file": "", "status": ""
+        "input_file": str(image_path), "confidence": "", "bbox_xyxy": "", "crop_file": "", "gray_file": "", "clahe_file": "", "adaptive_file": "", "status": ""
     }
     image = read_image(image_path)
     if image is None:
         record["status"] = "unreadable_image"
         return record
     try:
-        result = model.predict(source=image, conf=conf, verbose=False)[0]
+        result = model.predict(source=image, conf=conf, imgsz=imgsz, verbose=False)[0]
     except Exception as error:  # Keep batch processing even when a single inference fails.
         record["status"] = f"inference_error: {error}"
         return record
@@ -246,19 +301,17 @@ def process_image(model: YOLO, image_path: Path, conf: float, crop_dir: Path, re
         return record
 
     crop_path = unique_jpeg_path(crop_dir, f"{image_path.stem}_plate")
-    rectified_path = unique_jpeg_path(rectified_dir, f"{image_path.stem}_plate")
     if not write_image(crop_path, crop):
         record["status"] = "crop_write_error"
         return record
-    rectified, method = rectify_crop(crop)
-    rectified_gray = cv2.cvtColor(rectified, cv2.COLOR_BGR2GRAY)
-    if not write_image(rectified_path, rectified_gray):
-        record["status"] = "rectified_write_error"
-        record["crop_file"] = str(crop_path)
-        return record
-    record.update(
-        crop_file=str(crop_path), rectified_file=str(rectified_path), method=method, status="ok"
-    )
+    paths: dict[str, str] = {}
+    for name, variant in ocr_variants(crop, upscale).items():
+        variant_path = unique_jpeg_path(ocr_dirs[name], f"{image_path.stem}_plate_{name}")
+        if not write_image(variant_path, variant):
+            record.update(crop_file=str(crop_path), status=f"{name}_write_error")
+            return record
+        paths[f"{name}_file"] = str(variant_path)
+    record.update(crop_file=str(crop_path), status="ok", **paths)
     return record
 
 
@@ -274,24 +327,25 @@ def main() -> int:
     input_dir = args.input_dir.resolve()
     output_dir = args.output_dir.resolve()
     crop_dir = output_dir / "crops"
-    rectified_dir = output_dir / "rectified"
+    ocr_dirs = {name: output_dir / "ocr" / name for name in ("gray", "clahe", "adaptive")}
     crop_dir.mkdir(parents=True, exist_ok=True)
-    rectified_dir.mkdir(parents=True, exist_ok=True)
+    for directory in ocr_dirs.values():
+        directory.mkdir(parents=True, exist_ok=True)
     images = sorted(path for path in input_dir.iterdir() if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS)
     if not images:
         print(f"No JPG, JPEG, or PNG files found in: {input_dir}")
         return 0
 
     model = YOLO(str(args.weights))
-    fields = ["input_file", "confidence", "bbox_xyxy", "method", "crop_file", "rectified_file", "status"]
-    report_path = output_dir / "report.csv"
+    fields = ["input_file", "confidence", "bbox_xyxy", "crop_file", "gray_file", "clahe_file", "adaptive_file", "status"]
+    report_path = unique_report_path(output_dir)
     with report_path.open("w", newline="", encoding="utf-8-sig") as report:
         writer = csv.DictWriter(report, fieldnames=fields)
         writer.writeheader()
         for image_path in images:
-            record = process_image(model, image_path, args.conf, crop_dir, rectified_dir)
+            record = process_image(model, image_path, args.conf, args.imgsz, args.upscale, crop_dir, ocr_dirs)
             writer.writerow(record)
-            print(f"{image_path.name}: {record['status']}" + (f" ({record['method']})" if record["method"] else ""))
+            print(f"{image_path.name}: {record['status']}")
     print(f"Report: {report_path}")
     return 0
 
